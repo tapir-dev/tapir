@@ -2,15 +2,18 @@
 # Flow (run from this machine):
 #   1. release-plz update          # bump versions + write CHANGELOGs
 #   2. review the diff, commit, push
-#   3. release-plz release         # publish to crates.io, tag, GitHub release
+#   3. release-plz release         # tag + GitHub release (no crates.io)
 # See RELEASING.md for prerequisites (tokens) and the full procedure.
 
 [workspace]
-# Create a git tag and a GitHub release per published crate.
+# GitHub-only releases: tag + GitHub release, but no `cargo publish`. tapir is
+# consumed as a git dependency, not from crates.io.
+publish = false
 git_tag_enable = true
 git_release_enable = true
-# Catch API-breaking changes against the published version before releasing.
-semver_check = true
+# semver_check diffs the API against the crates.io-published version; with no
+# published baseline it has nothing to compare, so it stays off.
+semver_check = false
 
 # The three crates share one version in [workspace.package]; release together.
 [changelog]

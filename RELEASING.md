@@ -1,23 +1,23 @@
 # Releasing
 
 tapir is released from your machine with
-[`release-plz`](https://release-plz.dev/) — no CI yet. The three crates share
-one version (`[workspace.package] version` in `Cargo.toml`) and are released
-together.
+[`release-plz`](https://release-plz.dev/) — no CI yet. Releases are
+**GitHub-only**: a git tag and a GitHub release per crate, with no
+`cargo publish`. tapir is consumed as a git dependency, not from crates.io.
+
+The three crates share one version (`[workspace.package] version` in
+`Cargo.toml`) and are released together.
 
 The flow mirrors the two-step shape oxc uses, but driven locally:
 
 1. **Prepare** — bump versions and write changelogs (`release-plz update`).
-2. **Publish** — push tags, publish to crates.io, cut GitHub releases
-   (`release-plz release`).
+2. **Publish** — push tags and cut GitHub releases (`release-plz release`).
 
 ## Prerequisites
 
 - `release-plz` installed (`pacman -S release-plz`).
-- A crates.io token: run `cargo login` once (stored in
-  `~/.cargo/credentials.toml`), or export `CARGO_REGISTRY_TOKEN`.
-- A GitHub token for the release notes step:
-  `export GIT_TOKEN=$(gh auth token)`.
+- A GitHub token: `export GIT_TOKEN=$(gh auth token)`. No crates.io token is
+  needed, since we do not publish there.
 - A clean working tree. `release-plz` refuses to run with uncommitted or
   untracked files. The local-only `Makefile` and `docs/` are listed in
   `.git/info/exclude` so git ignores them without touching the tracked
@@ -39,7 +39,7 @@ level is best-effort — review the diff, and if you want a different level
 Then commit and push:
 
 ```sh
-git add Cargo.toml Cargo.lock '**/CHANGELOG.md' CHANGELOG.md
+git add Cargo.toml '**/CHANGELOG.md' CHANGELOG.md
 git commit -m "Release v$(grep '^version' Cargo.toml | head -1 | cut -d'\"' -f2)"
 git push
 ```
@@ -58,19 +58,19 @@ Then for real:
 GIT_TOKEN=$(gh auth token) release-plz release
 ```
 
-For each crate not yet on crates.io, this pushes a `<crate>-v<version>` tag,
-publishes to crates.io in dependency order (`tapir-ai` → `tapir-core` →
-`tapir`), and creates a GitHub release.
+For each crate at a version without a tag yet, this pushes a
+`<crate>-v<version>` tag and creates a GitHub release with the changelog notes.
 
-## Known blocker: the `tapir` crate name
+## Why GitHub-only?
 
-The `tapir` name on crates.io is already taken by an unrelated crate
-(`lcnr/tapir`, a tapping library). `tapir-core` and `tapir-ai` are free. Until
-this is resolved, publishing the `tapir` facade will fail. Options:
+The `tapir` name on crates.io belongs to an unrelated crate (`lcnr/tapir`, a
+tapping library), and the project lives under the `tapir` brand (domain,
+email) regardless. Publishing only to GitHub keeps the name and skips the
+registry entirely; consumers depend on it via git:
 
-- Rename the facade crate to a free name (e.g. `tapir-rs`), or
-- Mark the facade as unpublished (`publish = false` in `tapir/Cargo.toml`) and
-  release only `tapir-core` and `tapir-ai`, or
-- Ask the current owner to transfer the name.
+```toml
+tapir = { git = "https://github.com/tapir-dev/tapir" }
+```
 
-`tapir-core` and `tapir-ai` can be released today regardless.
+To publish to crates.io later, set `publish = true` (and likely
+`semver_check = true`) in `release-plz.toml` and add a crates.io token.
