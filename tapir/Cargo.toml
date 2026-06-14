@@ -1,6 +1,6 @@
 [package]
 name = "tapir"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
 description = "Build agents in Rust: a unified LLM layer and an agent engine."
 license = "ISC"

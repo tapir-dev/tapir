@@ -1,6 +1,6 @@
 [package]
 name = "tapir-core"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
 description = "tapir's agent engine: the turn loop, sessions, runtime, tools, and hooks."
 license = "ISC"
