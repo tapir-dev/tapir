@@ -1,0 +1,15 @@
+[package]
+name = "custom-tool"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "custom-tool"
+path = "src/main.rs"
+
+[dependencies]
+tapir.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

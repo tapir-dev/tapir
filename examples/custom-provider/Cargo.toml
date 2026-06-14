@@ -1,0 +1,16 @@
+[package]
+name = "custom-provider"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "custom-provider"
+path = "src/main.rs"
+
+[dependencies]
+tapir.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+# Only to name `reqwest::Client` in the `Provider::creds` signature we override.
+reqwest.workspace = true
+tokio.workspace = true

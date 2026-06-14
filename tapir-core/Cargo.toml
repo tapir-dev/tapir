@@ -1,0 +1,38 @@
+[package]
+name = "tapir-core"
+version.workspace = true
+edition.workspace = true
+description = "tapir's agent engine: the turn loop, sessions, runtime, tools, and hooks."
+license = "ISC"
+repository.workspace = true
+
+[dependencies]
+tapir-ai.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+directories.workspace = true
+futures.workspace = true
+globset.workspace = true
+grep.workspace = true
+ignore.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+similar.workspace = true
+tokio.workspace = true
+
+[features]
+# Test helpers (scripted loaders, fake run states) for dependent crates' tests.
+# Forwards to tapir-ai so re-exported `providers::testing` is available too.
+test-util = ["tapir-ai/test-util"]
+
+[dev-dependencies]
+# Enables tapir-ai's canned-SSE test doubles for this crate's own integration
+# tests (tests/live_rounds.rs drives a Runtime session through LiveRounds).
+tapir-ai = { workspace = true, features = ["test-util"] }
+# Only the test mock providers name `reqwest::Client` (the Provider::creds
+# signature); the engine itself goes through tapir-ai for HTTP.
+reqwest.workspace = true
+
+[lints]
+workspace = true

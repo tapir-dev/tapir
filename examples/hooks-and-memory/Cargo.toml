@@ -1,0 +1,17 @@
+[package]
+name = "hooks-and-memory"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "hooks-and-memory"
+path = "src/main.rs"
+
+[dependencies]
+tapir.workspace = true
+anyhow.workspace = true
+async-trait.workspace = true
+# Only to name `reqwest::Client` in the Provider::creds signature we override.
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

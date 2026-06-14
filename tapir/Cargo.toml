@@ -1,0 +1,19 @@
+[package]
+name = "tapir"
+version.workspace = true
+edition.workspace = true
+description = "Build agents in Rust: a unified LLM layer and an agent engine."
+license = "ISC"
+repository.workspace = true
+
+[dependencies]
+tapir-ai.workspace = true
+tapir-core.workspace = true
+
+[features]
+# Forwards the test doubles (canned SSE server, scripted runners) so a
+# downstream crate can drive an agent turn with no network in its own tests.
+test-util = ["tapir-core/test-util"]
+
+[lints]
+workspace = true

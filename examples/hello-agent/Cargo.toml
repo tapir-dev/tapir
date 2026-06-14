@@ -1,0 +1,13 @@
+[package]
+name = "hello-agent"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "hello-agent"
+path = "src/main.rs"
+
+[dependencies]
+tapir.workspace = true
+anyhow.workspace = true
+tokio.workspace = true

@@ -1,0 +1,53 @@
+[workspace]
+resolver = "3"
+members = ["tapir", "tapir-*"]
+# examples/ is its own workspace so example bins and their heavier dev deps
+# never enter the library's dependency graph.
+exclude = ["examples"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/tapir-dev/tapir"
+
+# Only the deps the library crates (tapir-ai, tapir-core) actually use. The
+# frontend-only deps (ratatui, clap, image, …) left with their crates in ../.
+[workspace.dependencies]
+tapir-ai = { path = "tapir-ai", version = "0.1.0" }
+tapir-core = { path = "tapir-core", version = "0.1.0" }
+anyhow = "1.0.102"
+async-trait = "0.1.89"
+chrono = "0.4.42"
+directories = "6.0.0"
+eventsource-stream = "0.2.3"
+futures = "0.3.32"
+globset = "0.4.18"
+grep = "0.4.1"
+ignore = "0.4.26"
+reqwest = { version = "0.12.27", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest-middleware = { version = "0.4", features = ["json"] }
+reqwest-retry = "0.7"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+similar = "2.7.0"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "process"] }
+toml = "1.1.2"
+
+# Minimal workspace lints (opt-in per crate via `[lints] workspace = true`).
+# `unsafe_code` is warn, not forbid: the env-var test doubles legitimately use
+# `unsafe { std::env::set_var }` (unsafe since Rust 2024). Tighten later.
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+
+# Dev builds: keep file:line in our own backtraces, skip debuginfo for the
+# dependencies nobody steps into. Big win on build time and target/ size.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
