@@ -1,0 +1,27 @@
+Third-party licenses
+====================
+
+tapir is distributed under the ISC license (see LICENSE). It builds on the
+third-party crates listed below, grouped by license. Each crate is the
+property of its respective authors and is distributed under the terms shown.
+
+Regenerate this file with: cargo about generate about.hbs > THIRD-PARTY-LICENSE
+
+Overview
+--------
+{{#each overview}}
+  {{{name}}} ({{count}})
+{{/each}}
+{{#each licenses}}
+
+================================================================================
+{{{name}}}
+================================================================================
+
+Used by:
+{{#each used_by}}
+  - {{{crate.name}}} {{{crate.version}}} ({{#if crate.repository}}{{{crate.repository}}}{{else}}https://crates.io/crates/{{{crate.name}}}{{/if}})
+{{/each}}
+
+{{{text}}}
+{{/each}}

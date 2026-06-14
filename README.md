@@ -57,3 +57,11 @@ cargo build --workspace
 cargo test --workspace      # some tests bind localhost / spawn processes
 cargo doc -p tapir --no-deps --open
 ```
+
+## License
+
+tapir is free and open-source software licensed under the
+[ISC License](LICENSE).
+
+It builds on third-party crates whose licenses are listed in
+[THIRD-PARTY-LICENSE](THIRD-PARTY-LICENSE).

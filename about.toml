@@ -1,0 +1,17 @@
+# Configuration for `cargo about generate about.hbs > THIRD-PARTY-LICENSE`.
+# Keep `accepted` in sync with the `allow` list in deny.toml.
+accepted = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+]
+
+# Only the crates that ship in the distributed artifact: drop test-only deps.
+ignore-dev-dependencies = true
