@@ -5,7 +5,8 @@ tapir is distributed under the ISC license (see LICENSE). It builds on the
 third-party crates listed below, grouped by license. Each crate is the
 property of its respective authors and is distributed under the terms shown.
 
-Regenerate this file with: cargo about generate about.hbs > THIRD-PARTY-LICENSE
+Regenerate this file with:
+  cargo about generate about.hbs | grep -vE '^  - tapir(-core|-ai)? ' > THIRD-PARTY-LICENSE
 
 Overview
 --------
@@ -4695,9 +4696,6 @@ ISC License
 ================================================================================
 
 Used by:
-  - tapir 0.1.0 (https://github.com/tapir-dev/tapir)
-  - tapir-ai 0.1.0 (https://github.com/tapir-dev/tapir)
-  - tapir-core 0.1.0 (https://github.com/tapir-dev/tapir)
 
 ISC License:
 
