@@ -1,0 +1,42 @@
+# cargo-deny configuration. Run `cargo deny check` to lint the dependency
+# graph for security advisories, license compatibility, banned crates, and
+# untrusted sources. https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+all-features = true
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "warn"
+ignore = [
+    # `instant` is unmaintained; pulled in transitively by reqwest-retry via
+    # parking_lot 0.11. No safe upgrade is available yet. Revisit when the
+    # upstream chain moves off it.
+    "RUSTSEC-2024-0384",
+]
+
+[licenses]
+# Permissive licenses present in the dependency tree, plus ISC (tapir's own).
+# Keep this list tight: a new license should be a deliberate decision.
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
