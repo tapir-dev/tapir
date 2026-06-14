@@ -1,0 +1,32 @@
+# release-plz configuration. Independent, per-crate versioning: each crate
+# bumps only when its own files change, and release-plz propagates bumps to
+# dependents as needed. Releases are GitHub-only (tag + GitHub release per
+# crate, no crates.io). See RELEASING.md.
+#
+# Flow (run from this machine, via `just`):
+#   1. just release-prepare   # release-plz update: per-crate bump + changelog
+#   2. review the diff, commit, push
+#   3. just release           # tag + GitHub release for each changed crate
+
+[workspace]
+publish = false
+git_tag_enable = true
+git_release_enable = true
+# semver_check diffs against the crates.io-published version; with no published
+# baseline it has nothing to compare, so it stays off.
+semver_check = false
+
+[changelog]
+# Conventional commits drive the grouping; the catch-all keeps anything that
+# slips through instead of dropping it.
+protect_breaking_commits = true
+sort_commits = "oldest"
+commit_parsers = [
+    { message = "^feat", group = "Added" },
+    { message = "^fix", group = "Fixed" },
+    { message = "^docs", group = "Documentation" },
+    { message = "^perf", group = "Performance" },
+    { message = "^refactor", group = "Changed" },
+    { message = "^chore", group = "Changed" },
+    { message = ".*", group = "Changed" },
+]
