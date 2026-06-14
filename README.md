@@ -58,6 +58,17 @@ cargo test --workspace      # some tests bind localhost / spawn processes
 cargo doc -p tapir --no-deps --open
 ```
 
+Common tasks are wrapped in a [`justfile`](justfile) — run `just` to list them:
+
+```sh
+just check        # type-check the workspace
+just test         # run the test suite
+just deny         # lint the dependency graph (cargo-deny)
+```
+
+Releasing is GitHub-only and also driven through `just`; see
+[RELEASING.md](RELEASING.md).
+
 ## License
 
 tapir is free and open-source software licensed under the
