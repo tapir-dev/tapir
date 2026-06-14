@@ -1,0 +1,32 @@
+# release-plz configuration for local-first releases.
+# Flow (run from this machine):
+#   1. release-plz update          # bump versions + write CHANGELOGs
+#   2. review the diff, commit, push
+#   3. release-plz release         # publish to crates.io, tag, GitHub release
+# See RELEASING.md for prerequisites (tokens) and the full procedure.
+
+[workspace]
+# Create a git tag and a GitHub release per published crate.
+git_tag_enable = true
+git_release_enable = true
+# Catch API-breaking changes against the published version before releasing.
+semver_check = true
+
+# The three crates share one version in [workspace.package]; release together.
+[changelog]
+# We do NOT use conventional commits, so the catch-all parser at the end keeps
+# every commit in the changelog instead of dropping non-matching ones. Verbs
+# are mapped to sections on a best-effort basis.
+protect_breaking_commits = true
+sort_commits = "oldest"
+commit_parsers = [
+    { message = "^[Aa]dd", group = "Added" },
+    { message = "^[Ss]upport", group = "Added" },
+    { message = "^[Ff]ix", group = "Fixed" },
+    { message = "^[Rr]emove", group = "Removed" },
+    { message = "^[Dd]rop", group = "Removed" },
+    { message = "^[Dd]oc", group = "Documentation" },
+    { message = "^[Rr]efactor|^[Cc]lean|^[Tt]ighten", group = "Changed" },
+    { message = "^[Bb]ump|^[Uu]pdate|^[Dd]eps", group = "Changed" },
+    { message = ".*", group = "Changed" },
+]
