@@ -164,9 +164,7 @@ pub fn roots_with(
     if let Some(config) = tapir_config {
         roots.push(config.join("skills"));
     }
-    if let Some(home) =
-        directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf())
-    {
+    if let Ok(home) = etcetera::home_dir() {
         // `~/.agents/skills` is the canonical cross-agent location
         // (other agents may symlink their own skills dir into it, so we skip those).
         roots.push(home.join(".agents").join("skills"));
@@ -373,7 +371,10 @@ mod tests {
         assert!(has(".agents/skills"), "the shared cross-agent location");
         assert!(has(".tapir/skills"), "project skills");
         // A foreign agent's own dir is not read (such dirs symlink into ~/.agents).
-        assert!(!has(".foreign-agent/skills"), "a foreign agent's dir is not a root");
+        assert!(
+            !has(".foreign-agent/skills"),
+            "a foreign agent's dir is not a root"
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use etcetera::BaseStrategy as _;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -52,8 +53,7 @@ pub fn dir() -> Option<PathBuf> {
     {
         return Some(PathBuf::from(d));
     }
-    directories::ProjectDirs::from("", "", "tapir")
-        .map(|d| d.config_dir().to_path_buf())
+    etcetera::choose_base_strategy().ok().map(|s| s.config_dir().join("tapir"))
 }
 
 /// Load `config.toml` (defaults if missing or invalid).

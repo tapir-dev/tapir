@@ -262,9 +262,7 @@ pub fn roots_with(
     if let Some(config) = tapir_config {
         roots.push(config.join("prompts"));
     }
-    if let Some(home) =
-        directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf())
-    {
+    if let Ok(home) = etcetera::home_dir() {
         roots.push(home.join(".agents").join("prompts"));
     }
     if trust_project {

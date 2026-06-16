@@ -17,7 +17,7 @@ tapir-core = { path = "tapir-core", version = "0.1.0" }
 anyhow = "1.0.102"
 async-trait = "0.1.89"
 chrono = "0.4.42"
-directories = "6.0.0"
+etcetera = "0.11.0"
 eventsource-stream = "0.2.3"
 futures = "0.3.32"
 globset = "0.4.18"
