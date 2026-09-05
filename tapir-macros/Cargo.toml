@@ -1,0 +1,19 @@
+[package]
+name = "tapir-macros"
+version = "0.1.0"
+edition = "2024"
+license = "ISC"
+description = "The #[tool] proc-macro for tapir, re-exported through tapir"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"
+
+# Declared for the `#[tool]` derive, which lands in a later ticket; the skeleton
+# passthrough does not yet reference them.
+[package.metadata.cargo-machete]
+ignored = ["syn", "quote", "proc-macro2"]

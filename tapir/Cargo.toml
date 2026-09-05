@@ -1,0 +1,33 @@
+[package]
+name = "tapir"
+version = "0.1.0"
+edition = "2024"
+license = "ISC"
+description = "Minimal, extensible stateful LLM agent SDK over tapir-provider"
+
+[dependencies]
+tapir-macros = { path = "../tapir-macros", version = "0.1.0" }
+tapir-provider = { workspace = true }
+async-trait = { workspace = true }
+futures-core = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
+fs4 = { workspace = true, optional = true }
+
+[features]
+default = []
+anthropic = ["tapir-provider/anthropic", "tapir-provider/models", "tapir-provider/reqwest"]
+openai = ["tapir-provider/openai", "tapir-provider/models", "tapir-provider/reqwest"]
+models = ["tapir-provider/models"]
+token-store-file = ["tapir-provider/token-store-file"]
+store-file = ["dep:fs4"]
+
+# Workspace-pinned per the crate skeleton spec, but not yet referenced by the
+# empty module tree; wired in by the tickets that build the run loop, tool
+# system, and file store.
+[package.metadata.cargo-machete]
+ignored = ["async-trait", "futures-core", "futures-util", "schemars", "tokio", "fs4"]
