@@ -1,0 +1,5 @@
+error[E0308]: mismatched types
+  --> tests/ui/heterogeneous_tool_array.rs:35:26
+   |
+35 |     let _tools = [alpha, beta];
+   |                          ^^^^ expected `alpha`, found `beta`

@@ -12,8 +12,3 @@ proc-macro = true
 syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
-
-# Declared for the `#[tool]` derive, which lands in a later ticket; the skeleton
-# passthrough does not yet reference them.
-[package.metadata.cargo-machete]
-ignored = ["syn", "quote", "proc-macro2"]

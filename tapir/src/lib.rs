@@ -26,3 +26,10 @@ pub use event::AgentEvent;
 pub use tapir_macros::tool;
 // Reach `Provider`/`Context`/`Model` without a second dependency.
 pub use tapir_provider;
+
+/// Re-exports the `#[tool]` derive expands against. Not part of the public API;
+/// no stability guarantee.
+#[doc(hidden)]
+pub mod __private {
+    pub use async_trait::async_trait;
+}
