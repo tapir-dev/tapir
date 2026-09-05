@@ -111,24 +111,17 @@ impl From<&str> for ToolOutput {
 pub struct ToolError {
     pub model_message: String,
     pub operator_detail: Option<Box<dyn Error + Send + Sync>>,
-    /// Whether the run loop may auto-retry (bounded). Default false.
-    pub retryable: bool,
 }
 
 impl ToolError {
     /// Model-visible error, no operator detail.
     pub fn model(msg: impl Into<String>) -> Self {
-        Self { model_message: msg.into(), operator_detail: None, retryable: false }
+        Self { model_message: msg.into(), operator_detail: None }
     }
     /// Attach operator-only detail (kept out of the model's view).
     #[must_use]
     pub fn with_operator(mut self, e: impl Into<Box<dyn Error + Send + Sync>>) -> Self {
         self.operator_detail = Some(e.into());
-        self
-    }
-    #[must_use]
-    pub fn retryable(mut self) -> Self {
-        self.retryable = true;
         self
     }
     /// The one error the boundary mints itself: raw JSON failed to become `Args`.
@@ -170,12 +163,10 @@ pub trait Tool: Send + Sync + 'static {
         portable_schema::<Self::Args>()
     }
 
-    /// Metadata. Safe defaults: serialize (Exclusive) and assume mutation.
+    /// Scheduling class. Safe default: serialize (assume mutation). `read_only`
+    /// is not a separate axis — a tool is read-only iff it is `Safe`.
     fn concurrency(&self) -> Concurrency {
         Concurrency::Exclusive
-    }
-    fn read_only(&self) -> bool {
-        false
     }
 
     /// Run the tool. `on_update` streams partials; `ctx` carries cancellation.
@@ -228,7 +219,8 @@ impl<T: Tool> ErasedTool for T {
         Tool::concurrency(self)
     }
     fn read_only(&self) -> bool {
-        Tool::read_only(self)
+        // derived, not a separate axis: read-only iff parallel-safe
+        Tool::concurrency(self) == Concurrency::Safe
     }
     async fn invoke(
         &self,
@@ -396,10 +388,7 @@ impl Tool for GetWeather {
         "Get current weather for a location"
     }
     fn concurrency(&self) -> Concurrency {
-        Concurrency::Safe
-    }
-    fn read_only(&self) -> bool {
-        true
+        Concurrency::Safe // => read_only is derived true
     }
 
     async fn execute(
@@ -517,7 +506,6 @@ async fn dispatch(
             if let Some(op) = &e.operator_detail {
                 println!("           operator-only (never sent to model): {op}");
             }
-            println!("           retryable={}", e.retryable);
         }
     }
 }
