@@ -33,7 +33,7 @@ use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
 use serde_json::json;
 use tapir_provider::{
-    AssistantMessage, CompletionOptions, ContentPart, Context, Error, ErrorKind,
+    AssistantMessage, CompletionOptions, ContentPart, Context, Error,
     FinishReason, Message, Provider, StreamAccumulator, StreamEvent,
     StreamEvents, Usage,
 };
@@ -47,6 +47,38 @@ use tokio::sync::{broadcast, mpsc};
 /// turns. Lets a session-wide subscriber tell concurrent runs apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunId(pub u64);
+
+/// Prototype stand-in for `tapir::Error`, the SDK error type ticket #7 locked:
+/// a `thiserror` enum wrapping `tapir_provider::Error` verbatim plus the
+/// SDK-native run failures. A terminal run error is one of THESE, not just a
+/// provider error - so cancellation and the iteration cap surface through the
+/// same event. Runtime-only (not serde); not `Clone` (wraps a provider `Error`,
+/// which boxes its source), so the event carries it behind an `Arc`.
+#[derive(Debug)]
+pub enum SdkError {
+    /// A provider round-trip failed; the provider error, preserved verbatim.
+    Provider(Error),
+    /// The run hit its turn cap without settling.
+    MaxIterations { limit: usize },
+    /// The run was aborted (cancellation / steering drop).
+    Cancelled,
+}
+
+impl std::fmt::Display for SdkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Provider(e) => write!(f, "provider: {}", e.message()),
+            Self::MaxIterations { limit } => {
+                write!(f, "hit max iterations ({limit})")
+            }
+            Self::Cancelled => write!(f, "run cancelled"),
+        }
+    }
+}
+
+/// The run's turn cap: a real run loop needs one so a tool-call ping-pong
+/// can't spin forever. Surfaces as `SdkError::MaxIterations`.
+const MAX_TURNS: usize = 32;
 
 /// Everything a caller can observe while an agent runs. Single flat enum: a
 /// `match` sees the whole vocabulary, and one channel type carries all of it.
@@ -102,11 +134,12 @@ pub enum AgentEvent {
     /// The turn finished: message settled and any tool batch drained.
     TurnEnd { turn: usize },
 
-    /// The provider stream failed. A first-class EVENT, not a `Result` wrapper
-    /// on the stream item, so a session-wide subscriber sees failures too. It
-    /// is the last event of a failed run (no `AgentEnd` follows). `Arc` because
-    /// `tapir_provider::Error` is not `Clone` (it boxes its source).
-    ProviderError { turn: usize, error: Arc<Error> },
+    /// The run failed. A first-class EVENT carrying the SDK error (#7), not a
+    /// `Result` wrapper on the stream item - so a session-wide subscriber sees
+    /// failures, and provider errors, the iteration cap, and cancellation all
+    /// arrive the same way. It is the last event of a failed run (no `AgentEnd`
+    /// follows). `Arc` because `SdkError`/`tapir::Error` is not `Clone`.
+    Error { turn: usize, error: Arc<SdkError> },
 
     /// The run finished. TERMINAL item; carries the settled final message -
     /// the reply that stopped without asking for a tool.
@@ -143,7 +176,7 @@ impl futures::Stream for Run {
 }
 
 impl IntoFuture for Run {
-    type Output = Result<AssistantMessage, Arc<Error>>;
+    type Output = Result<AssistantMessage, Arc<SdkError>>;
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send>>;
 
     /// The await-the-final-message shortcut: drain events, keep only the
@@ -153,16 +186,11 @@ impl IntoFuture for Run {
             while let Some(ev) = self.rx.recv().await {
                 match ev {
                     AgentEvent::AgentEnd { message, .. } => return Ok(message),
-                    AgentEvent::ProviderError { error, .. } => {
-                        return Err(error);
-                    }
+                    AgentEvent::Error { error, .. } => return Err(error),
                     _ => {}
                 }
             }
-            Err(Arc::new(Error::new(
-                ErrorKind::Other,
-                "run ended without a terminal event",
-            )))
+            Err(Arc::new(SdkError::Cancelled))
         })
     }
 }
@@ -267,6 +295,13 @@ async fn run_loop(
 
     let mut turn = 0usize;
     let final_message = loop {
+        if turn >= MAX_TURNS {
+            emit(AgentEvent::Error {
+                turn,
+                error: Arc::new(SdkError::MaxIterations { limit: MAX_TURNS }),
+            });
+            return;
+        }
         emit(AgentEvent::TurnStart { turn });
 
         // Snapshot state into a provider Context (one clone per turn: the
@@ -287,9 +322,9 @@ async fn run_loop(
         let mut events = match provider.complete_stream(&ctx, &opts).await {
             Ok(events) => events,
             Err(error) => {
-                emit(AgentEvent::ProviderError {
+                emit(AgentEvent::Error {
                     turn,
-                    error: Arc::new(error),
+                    error: Arc::new(SdkError::Provider(error)),
                 });
                 return;
             }
@@ -301,9 +336,9 @@ async fn run_loop(
                     emit(AgentEvent::MessageUpdate { turn, delta });
                 }
                 Err(error) => {
-                    emit(AgentEvent::ProviderError {
+                    emit(AgentEvent::Error {
                         turn,
-                        error: Arc::new(error),
+                        error: Arc::new(SdkError::Provider(error)),
                     });
                     return;
                 }
@@ -512,8 +547,8 @@ async fn render_like_a_tui(mut run: Run) {
             AgentEvent::TurnEnd { turn } => {
                 println!("--- turn {turn} end ---");
             }
-            AgentEvent::ProviderError { error, .. } => {
-                println!("  !! provider error: {}", error.message());
+            AgentEvent::Error { error, .. } => {
+                println!("  !! run error: {error}");
             }
             AgentEvent::AgentEnd { message, .. } => {
                 println!("\n[run done] final: {:?}", message.text_content());
