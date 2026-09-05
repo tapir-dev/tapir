@@ -1,0 +1,13 @@
+# PROTOTYPE - throwaway, do not merge to main. Answers wayfinder ticket #6.
+[package]
+name = "proto-agentevent"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+tapir-provider = { path = "../../../../../../tapir-provider" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+futures = "0.3"
+async-trait = "0.1"
+serde_json = "1"
