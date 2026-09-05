@@ -217,6 +217,31 @@ async fn registered_tool_runs_and_result_feeds_back() {
 }
 
 #[tokio::test]
+async fn bulk_registered_tool_is_invoked() {
+    // The `.tools()` bulk path registers an already-erased collection; a call
+    // to one of them runs and feeds back just like `.tool()`.
+    let provider = ScriptedProvider::new(vec![
+        tool_calls_script(&[("call_1", "weather", json!({"city": "Rome"}))]),
+        text_script("clear in Rome"),
+    ]);
+    let seen = provider.seen();
+    let erased: Vec<std::sync::Arc<dyn tapir::tool::ErasedTool>> =
+        vec![std::sync::Arc::new(Weather)];
+    let agent = Agent::builder()
+        .provider(provider)
+        .tools(erased)
+        .build()
+        .expect("build");
+
+    let reply = agent.prompt("Weather in Rome?").await.expect("run");
+    assert_eq!(reply.text_content(), "clear in Rome");
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen[0].tools_offered, 1);
+    assert_eq!(seen[1].tool_results, 1);
+}
+
+#[tokio::test]
 async fn tool_execution_events_in_order() {
     let provider = ScriptedProvider::new(vec![
         tool_calls_script(&[("call_1", "weather", json!({"city": "Paris"}))]),

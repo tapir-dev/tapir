@@ -62,8 +62,11 @@ pub enum AgentEvent {
         message: AssistantMessage,
     },
 
-    /// A tool call in this turn's batch began executing. Brackets one call's
-    /// run, told apart from siblings by `call_id`.
+    /// A tool call in this turn's batch was dispatched. Brackets one call's
+    /// handling, told apart from siblings by `call_id`. Emitted for every call
+    /// in model order, including one naming an unknown tool (whose
+    /// [`ToolExecutionEnd`](Self::ToolExecutionEnd) carries a synthetic
+    /// `is_error` result).
     ToolExecutionStart {
         /// The turn whose batch this call belongs to.
         turn: usize,
