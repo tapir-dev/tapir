@@ -4,9 +4,9 @@
 //! The stateful agent and its run surface. An [`Agent`] owns the in-memory
 //! conversation history and drives runs. Each run is a hybrid kernel: an async
 //! driver (`run_loop`) owns the IO, while the pure `step` function decides the
-//! turn-to-turn transition and is unit-testable with no async or IO. This
-//! ticket ships the tool-free spine — the model just replies; tool execution,
-//! cancellation, and steering land in later tickets.
+//! turn-to-turn transition and is unit-testable with no async or IO. The driver
+//! runs a tool-requesting turn's batch sequentially, feeding each result back
+//! into history; cancellation and steering land in later tickets.
 
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
@@ -16,9 +16,10 @@ use std::task::{Context as TaskContext, Poll};
 
 use futures_core::Stream;
 use futures_util::StreamExt;
+use serde_json::Value;
 use tapir_provider::{
-    AssistantMessage, CompletionOptions, Context, Message, Provider,
-    StreamAccumulator,
+    AssistantMessage, CompletionOptions, ContentPart, Context, Message,
+    Provider, StreamAccumulator, ToolDefinition, ToolResultMessage,
 };
 use tokio::sync::{broadcast, mpsc};
 
@@ -27,6 +28,7 @@ use crate::event::AgentEvent;
 use crate::message::{
     AgentMessage, CustomMessage, NoCustom, TransformContext, convert_to_llm,
 };
+use crate::tool::{ErasedTool, Tool, ToolCtx, UpdateSink};
 
 /// Default cap on tool-requesting turns before a run fails with
 /// [`Error::MaxIterations`].
@@ -99,6 +101,7 @@ pub struct AgentBuilder<M = NoCustom> {
     provider: Option<Arc<dyn Provider>>,
     system: Option<String>,
     max_tool_iterations: usize,
+    tools: Vec<Arc<dyn ErasedTool>>,
     _marker: std::marker::PhantomData<fn() -> M>,
 }
 
@@ -108,6 +111,7 @@ impl<M> Default for AgentBuilder<M> {
             provider: None,
             system: None,
             max_tool_iterations: DEFAULT_MAX_TOOL_ITERATIONS,
+            tools: Vec::new(),
             _marker: std::marker::PhantomData,
         }
     }
@@ -143,6 +147,27 @@ impl<M> AgentBuilder<M> {
         self
     }
 
+    /// Register a tool. Chainable and the only way to add tools of differing
+    /// types (a literal array of heterogeneous `#[tool]` fns will not compile),
+    /// so each `Tool` erases here to an `Arc<dyn ErasedTool>` the run loop
+    /// stores uniformly.
+    #[must_use]
+    pub fn tool<T: Tool>(mut self, tool: T) -> Self {
+        self.tools.push(Arc::new(tool));
+        self
+    }
+
+    /// Register an already-erased collection of tools in bulk, appending to any
+    /// added with [`tool`](Self::tool).
+    #[must_use]
+    pub fn tools(
+        mut self,
+        tools: impl IntoIterator<Item = Arc<dyn ErasedTool>>,
+    ) -> Self {
+        self.tools.extend(tools);
+        self
+    }
+
     /// Validate the configuration and build the agent. Synchronous: the only
     /// v1 check is that a provider was set. A missing provider is
     /// [`Error::Build`].
@@ -155,6 +180,7 @@ impl<M> AgentBuilder<M> {
             provider,
             system: self.system,
             max_tool_iterations: self.max_tool_iterations,
+            tools: Arc::new(self.tools),
             transform: None,
             messages: Arc::new(Mutex::new(Vec::new())),
             events,
@@ -170,6 +196,8 @@ pub struct Agent<M = NoCustom> {
     provider: Arc<dyn Provider>,
     system: Option<String>,
     max_tool_iterations: usize,
+    /// The registered tools, erased and shared into every run.
+    tools: Arc<Vec<Arc<dyn ErasedTool>>>,
     /// The `transform_context` seam applied to history each turn before
     /// `convert_to_llm`. `None` is the identity (no reshaping); the builder
     /// that installs one lands in a later ticket.
@@ -216,6 +244,7 @@ impl<M: CustomMessage + Send + 'static> Agent<M> {
             provider: self.provider.clone(),
             system: self.system.clone(),
             max_tool_iterations: self.max_tool_iterations,
+            tools: self.tools.clone(),
             transform: self.transform.clone(),
             messages: self.messages.clone(),
             tx,
@@ -273,6 +302,7 @@ struct RunLoop<M> {
     provider: Arc<dyn Provider>,
     system: Option<String>,
     max_tool_iterations: usize,
+    tools: Arc<Vec<Arc<dyn ErasedTool>>>,
     transform: Option<Arc<TransformContext<M>>>,
     messages: Arc<Mutex<Vec<AgentMessage<M>>>>,
     tx: mpsc::UnboundedSender<AgentEvent>,
@@ -290,11 +320,16 @@ async fn run_loop<M: CustomMessage + Send + 'static>(driver: RunLoop<M>) {
         provider,
         system,
         max_tool_iterations,
+        tools,
         transform,
         messages,
         tx,
         bcast,
     } = driver;
+    // The provider-ready definitions offered every turn; derived once since the
+    // tool set is fixed for the run.
+    let tool_defs: Vec<ToolDefinition> =
+        tools.iter().map(|t| t.definition()).collect();
     // Fan each event out both the per-run stream and the session broadcast.
     let emit = |ev: AgentEvent| {
         let _ = bcast.send(ev.clone());
@@ -325,6 +360,9 @@ async fn run_loop<M: CustomMessage + Send + 'static>(driver: RunLoop<M>) {
             let mut ctx = Context::new(llm_messages);
             if let Some(system) = &system {
                 ctx = ctx.with_system(system.clone());
+            }
+            if !tool_defs.is_empty() {
+                ctx = ctx.with_tools(tool_defs.clone());
             }
             ctx
         };
@@ -381,8 +419,38 @@ async fn run_loop<M: CustomMessage + Send + 'static>(driver: RunLoop<M>) {
             }
         }
 
-        // Tool execution lands in a later ticket. With no tools to run, a
-        // tool-requesting reply simply advances to the next turn.
+        // Drain the batch sequentially, in the model's order. Each call runs
+        // through the erased tool's `invoke` boundary; its result (success or
+        // an `is_error` failure) is appended to history so the next turn
+        // re-prompts on it. A bad-arg or author error is a `ToolResult`, never
+        // a `tapir::Error`, so the run continues within the cap.
+        for (call_id, name, arguments) in tool_calls_of(&message) {
+            emit(AgentEvent::ToolExecutionStart {
+                turn,
+                call_id: call_id.clone(),
+                name: name.clone(),
+            });
+            let result = {
+                let mut sink = |update| {
+                    emit(AgentEvent::ToolExecutionUpdate {
+                        turn,
+                        call_id: call_id.clone(),
+                        update,
+                    });
+                };
+                run_one_call(&tools, &call_id, &name, arguments, &mut sink)
+                    .await
+            };
+            emit(AgentEvent::ToolExecutionEnd {
+                turn,
+                result: result.clone(),
+            });
+            messages
+                .lock()
+                .expect("history mutex poisoned")
+                .push(AgentMessage::Llm(Message::ToolResult(result)));
+        }
+
         emit(AgentEvent::TurnEnd { turn });
         turn += 1;
     };
@@ -393,6 +461,73 @@ async fn run_loop<M: CustomMessage + Send + 'static>(driver: RunLoop<M>) {
             turn: Some(turn),
             error: Arc::new(error),
         }),
+    }
+}
+
+/// The reply's tool calls as owned `(id, name, arguments)` tuples, in model
+/// order. Owning them frees the reply so history can be mutated during the
+/// batch without a live borrow.
+fn tool_calls_of(message: &AssistantMessage) -> Vec<(String, String, Value)> {
+    message
+        .tool_calls()
+        .filter_map(|part| match part {
+            ContentPart::ToolCall {
+                id,
+                name,
+                arguments,
+            } => Some((id.clone(), name.clone(), arguments.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Run a single tool call through the dispatch boundary and shape the outcome
+/// into a [`ToolResultMessage`] to feed back to the model.
+///
+/// Every path yields a result rather than an error: an unknown tool produces a
+/// synthetic `is_error` result in model order, and a bad-arg or author failure
+/// rides back as an `is_error` result carrying only the model-visible message
+/// (operator detail is dropped here; a logging seam lands later).
+async fn run_one_call(
+    tools: &[Arc<dyn ErasedTool>],
+    call_id: &str,
+    name: &str,
+    arguments: Value,
+    sink: &mut UpdateSink<'_>,
+) -> ToolResultMessage {
+    let Some(tool) = tools.iter().find(|t| t.name() == name) else {
+        return tool_result(
+            call_id,
+            name,
+            vec![ContentPart::text(format!("unknown tool `{name}`"))],
+            true,
+        );
+    };
+
+    let ctx = ToolCtx::new(call_id);
+    match tool.invoke(arguments, &ctx, sink).await {
+        Ok(output) => tool_result(call_id, name, output.content, false),
+        Err(error) => tool_result(
+            call_id,
+            name,
+            vec![ContentPart::text(error.model_message)],
+            true,
+        ),
+    }
+}
+
+/// Assemble a [`ToolResultMessage`] answering `call_id`.
+fn tool_result(
+    call_id: &str,
+    name: &str,
+    content: Vec<ContentPart>,
+    is_error: bool,
+) -> ToolResultMessage {
+    ToolResultMessage {
+        tool_call_id: call_id.to_owned(),
+        tool_name: name.to_owned(),
+        content,
+        is_error,
     }
 }
 

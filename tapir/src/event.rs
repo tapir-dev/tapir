@@ -5,16 +5,18 @@
 //! and one channel type carries all of it. Nesting is by convention, not by
 //! type: an `AgentStart` brackets N turns; each `TurnStart..TurnEnd` brackets
 //! one message (`MessageStart` / `MessageUpdate`* / `MessageEnd`). Every mid-run
-//! event carries a `turn`, so a flat consumer can re-derive the nesting. This
-//! ticket ships the core (tool-free) variants; tool-execution variants join the
-//! set in a later ticket.
+//! event carries a `turn`, so a flat consumer can re-derive the nesting. A
+//! tool-requesting turn also brackets each call it runs
+//! (`ToolExecutionStart` / `ToolExecutionUpdate`* / `ToolExecutionEnd`), nested
+//! inside the turn after its `MessageEnd`.
 
 use std::sync::Arc;
 
-use tapir_provider::{AssistantMessage, StreamEvent};
+use tapir_provider::{AssistantMessage, StreamEvent, ToolResultMessage};
 
 use crate::agent::RunId;
 use crate::error::Error;
+use crate::tool::ToolUpdate;
 
 /// The single flat event type streamed from a run.
 #[non_exhaustive]
@@ -60,8 +62,40 @@ pub enum AgentEvent {
         message: AssistantMessage,
     },
 
-    /// The turn finished: its message settled (and, later, any tool batch
-    /// drained).
+    /// A tool call in this turn's batch began executing. Brackets one call's
+    /// run, told apart from siblings by `call_id`.
+    ToolExecutionStart {
+        /// The turn whose batch this call belongs to.
+        turn: usize,
+        /// The model-supplied id of the call being run.
+        call_id: String,
+        /// The name of the tool being invoked.
+        name: String,
+    },
+
+    /// A progress update streamed by a tool mid-execution, forwarded verbatim
+    /// from the tool's `on_update` sink onto the one flat stream.
+    ToolExecutionUpdate {
+        /// The turn whose batch this call belongs to.
+        turn: usize,
+        /// The id of the call that emitted the update.
+        call_id: String,
+        /// The tool's progress update.
+        update: ToolUpdate,
+    },
+
+    /// A tool call finished. Carries the settled [`ToolResultMessage`] — the
+    /// same result appended to history and fed back to the model — so a consumer
+    /// sees the outcome (including [`is_error`](ToolResultMessage::is_error))
+    /// without re-deriving it.
+    ToolExecutionEnd {
+        /// The turn whose batch this call belonged to.
+        turn: usize,
+        /// The settled result carried back to the model.
+        result: ToolResultMessage,
+    },
+
+    /// The turn finished: its message settled and any tool batch drained.
     TurnEnd {
         /// The turn that finished.
         turn: usize,
