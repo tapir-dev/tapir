@@ -1,0 +1,10 @@
+/home/ijanc/src/coding-agent/tapir-provider/.claude/worktrees/issue-1-tracer-bullet/target/debug/build/litemap/9b642043bd80ad18/out/litemap-9b642043bd80ad18.d: /home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.3/src/lib.rs /home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.3/src/map.rs /home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.3/src/store/mod.rs /home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.3/src/store/slice_impl.rs
+
+/home/ijanc/src/coding-agent/tapir-provider/.claude/worktrees/issue-1-tracer-bullet/target/debug/build/litemap/9b642043bd80ad18/out/liblitemap-9b642043bd80ad18.rlib: /home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.3/src/lib.rs /home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.3/src/map.rs /home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.3/src/store/mod.rs /home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.3/src/store/slice_impl.rs
+
+/home/ijanc/src/coding-agent/tapir-provider/.claude/worktrees/issue-1-tracer-bullet/target/debug/build/litemap/9b642043bd80ad18/out/liblitemap-9b642043bd80ad18.rmeta: /home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.3/src/lib.rs /home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.3/src/map.rs /home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.3/src/store/mod.rs /home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.3/src/store/slice_impl.rs
+
+/home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.3/src/lib.rs:
+/home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.3/src/map.rs:
+/home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.3/src/store/mod.rs:
+/home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/litemap-0.8.3/src/store/slice_impl.rs:

@@ -1,0 +1,9 @@
+/home/ijanc/src/coding-agent/tapir/.claude/worktrees/proto-agentevent/prototypes/agentevent/target/debug/build/futures-executor/0eb7ab6b12a5af33/out/futures_executor-0eb7ab6b12a5af33.d: /home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-executor-0.3.34/src/lib.rs /home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-executor-0.3.34/src/local_pool.rs /home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-executor-0.3.34/src/enter.rs
+
+/home/ijanc/src/coding-agent/tapir/.claude/worktrees/proto-agentevent/prototypes/agentevent/target/debug/build/futures-executor/0eb7ab6b12a5af33/out/libfutures_executor-0eb7ab6b12a5af33.rlib: /home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-executor-0.3.34/src/lib.rs /home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-executor-0.3.34/src/local_pool.rs /home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-executor-0.3.34/src/enter.rs
+
+/home/ijanc/src/coding-agent/tapir/.claude/worktrees/proto-agentevent/prototypes/agentevent/target/debug/build/futures-executor/0eb7ab6b12a5af33/out/libfutures_executor-0eb7ab6b12a5af33.rmeta: /home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-executor-0.3.34/src/lib.rs /home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-executor-0.3.34/src/local_pool.rs /home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-executor-0.3.34/src/enter.rs
+
+/home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-executor-0.3.34/src/lib.rs:
+/home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-executor-0.3.34/src/local_pool.rs:
+/home/ijanc/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/futures-executor-0.3.34/src/enter.rs:

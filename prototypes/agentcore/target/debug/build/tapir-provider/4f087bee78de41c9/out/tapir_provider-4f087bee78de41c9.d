@@ -1,0 +1,24 @@
+/home/ijanc/src/coding-agent/tapir/.claude/worktrees/proto+wayfinder-8-agent-core/prototypes/agentcore/target/debug/build/tapir-provider/4f087bee78de41c9/out/tapir_provider-4f087bee78de41c9.d: /home/ijanc/src/coding-agent/tapir-provider/src/lib.rs /home/ijanc/src/coding-agent/tapir-provider/src/auth.rs /home/ijanc/src/coding-agent/tapir-provider/src/credential.rs /home/ijanc/src/coding-agent/tapir-provider/src/embedding.rs /home/ijanc/src/coding-agent/tapir-provider/src/error.rs /home/ijanc/src/coding-agent/tapir-provider/src/http.rs /home/ijanc/src/coding-agent/tapir-provider/src/message.rs /home/ijanc/src/coding-agent/tapir-provider/src/model/mod.rs /home/ijanc/src/coding-agent/tapir-provider/src/model/id.rs /home/ijanc/src/coding-agent/tapir-provider/src/provider.rs /home/ijanc/src/coding-agent/tapir-provider/src/providers/mod.rs /home/ijanc/src/coding-agent/tapir-provider/src/registry.rs /home/ijanc/src/coding-agent/tapir-provider/src/request.rs /home/ijanc/src/coding-agent/tapir-provider/src/response.rs /home/ijanc/src/coding-agent/tapir-provider/src/retry.rs /home/ijanc/src/coding-agent/tapir-provider/src/sse.rs /home/ijanc/src/coding-agent/tapir-provider/src/stream.rs /home/ijanc/src/coding-agent/tapir-provider/src/token_store.rs
+
+/home/ijanc/src/coding-agent/tapir/.claude/worktrees/proto+wayfinder-8-agent-core/prototypes/agentcore/target/debug/build/tapir-provider/4f087bee78de41c9/out/libtapir_provider-4f087bee78de41c9.rlib: /home/ijanc/src/coding-agent/tapir-provider/src/lib.rs /home/ijanc/src/coding-agent/tapir-provider/src/auth.rs /home/ijanc/src/coding-agent/tapir-provider/src/credential.rs /home/ijanc/src/coding-agent/tapir-provider/src/embedding.rs /home/ijanc/src/coding-agent/tapir-provider/src/error.rs /home/ijanc/src/coding-agent/tapir-provider/src/http.rs /home/ijanc/src/coding-agent/tapir-provider/src/message.rs /home/ijanc/src/coding-agent/tapir-provider/src/model/mod.rs /home/ijanc/src/coding-agent/tapir-provider/src/model/id.rs /home/ijanc/src/coding-agent/tapir-provider/src/provider.rs /home/ijanc/src/coding-agent/tapir-provider/src/providers/mod.rs /home/ijanc/src/coding-agent/tapir-provider/src/registry.rs /home/ijanc/src/coding-agent/tapir-provider/src/request.rs /home/ijanc/src/coding-agent/tapir-provider/src/response.rs /home/ijanc/src/coding-agent/tapir-provider/src/retry.rs /home/ijanc/src/coding-agent/tapir-provider/src/sse.rs /home/ijanc/src/coding-agent/tapir-provider/src/stream.rs /home/ijanc/src/coding-agent/tapir-provider/src/token_store.rs
+
+/home/ijanc/src/coding-agent/tapir/.claude/worktrees/proto+wayfinder-8-agent-core/prototypes/agentcore/target/debug/build/tapir-provider/4f087bee78de41c9/out/libtapir_provider-4f087bee78de41c9.rmeta: /home/ijanc/src/coding-agent/tapir-provider/src/lib.rs /home/ijanc/src/coding-agent/tapir-provider/src/auth.rs /home/ijanc/src/coding-agent/tapir-provider/src/credential.rs /home/ijanc/src/coding-agent/tapir-provider/src/embedding.rs /home/ijanc/src/coding-agent/tapir-provider/src/error.rs /home/ijanc/src/coding-agent/tapir-provider/src/http.rs /home/ijanc/src/coding-agent/tapir-provider/src/message.rs /home/ijanc/src/coding-agent/tapir-provider/src/model/mod.rs /home/ijanc/src/coding-agent/tapir-provider/src/model/id.rs /home/ijanc/src/coding-agent/tapir-provider/src/provider.rs /home/ijanc/src/coding-agent/tapir-provider/src/providers/mod.rs /home/ijanc/src/coding-agent/tapir-provider/src/registry.rs /home/ijanc/src/coding-agent/tapir-provider/src/request.rs /home/ijanc/src/coding-agent/tapir-provider/src/response.rs /home/ijanc/src/coding-agent/tapir-provider/src/retry.rs /home/ijanc/src/coding-agent/tapir-provider/src/sse.rs /home/ijanc/src/coding-agent/tapir-provider/src/stream.rs /home/ijanc/src/coding-agent/tapir-provider/src/token_store.rs
+
+/home/ijanc/src/coding-agent/tapir-provider/src/lib.rs:
+/home/ijanc/src/coding-agent/tapir-provider/src/auth.rs:
+/home/ijanc/src/coding-agent/tapir-provider/src/credential.rs:
+/home/ijanc/src/coding-agent/tapir-provider/src/embedding.rs:
+/home/ijanc/src/coding-agent/tapir-provider/src/error.rs:
+/home/ijanc/src/coding-agent/tapir-provider/src/http.rs:
+/home/ijanc/src/coding-agent/tapir-provider/src/message.rs:
+/home/ijanc/src/coding-agent/tapir-provider/src/model/mod.rs:
+/home/ijanc/src/coding-agent/tapir-provider/src/model/id.rs:
+/home/ijanc/src/coding-agent/tapir-provider/src/provider.rs:
+/home/ijanc/src/coding-agent/tapir-provider/src/providers/mod.rs:
+/home/ijanc/src/coding-agent/tapir-provider/src/registry.rs:
+/home/ijanc/src/coding-agent/tapir-provider/src/request.rs:
+/home/ijanc/src/coding-agent/tapir-provider/src/response.rs:
+/home/ijanc/src/coding-agent/tapir-provider/src/retry.rs:
+/home/ijanc/src/coding-agent/tapir-provider/src/sse.rs:
+/home/ijanc/src/coding-agent/tapir-provider/src/stream.rs:
+/home/ijanc/src/coding-agent/tapir-provider/src/token_store.rs:

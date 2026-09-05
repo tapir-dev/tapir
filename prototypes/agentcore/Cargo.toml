@@ -1,0 +1,19 @@
+# PROTOTYPE - throwaway, do not merge to main. Answers wayfinder ticket #8.
+# Empty [workspace] table makes this its own workspace root, so cargo does not
+# fold it into the surrounding `tapir` crate.
+[workspace]
+
+[package]
+name = "proto-agentcore"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+tapir-provider = { path = "../../../../../../tapir-provider" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-util = "0.7"
+futures = "0.3"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
