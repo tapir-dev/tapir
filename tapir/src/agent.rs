@@ -424,22 +424,21 @@ async fn run_loop<M: CustomMessage + Send + 'static>(driver: RunLoop<M>) {
         // an `is_error` failure) is appended to history so the next turn
         // re-prompts on it. A bad-arg or author error is a `ToolResult`, never
         // a `tapir::Error`, so the run continues within the cap.
-        for (call_id, name, arguments) in tool_calls_of(&message) {
+        for call in tool_calls_of(&message) {
             emit(AgentEvent::ToolExecutionStart {
                 turn,
-                call_id: call_id.clone(),
-                name: name.clone(),
+                call_id: call.id.clone(),
+                name: call.name.clone(),
             });
             let result = {
                 let mut sink = |update| {
                     emit(AgentEvent::ToolExecutionUpdate {
                         turn,
-                        call_id: call_id.clone(),
+                        call_id: call.id.clone(),
                         update,
                     });
                 };
-                run_one_call(&tools, &call_id, &name, arguments, &mut sink)
-                    .await
+                run_one_call(&tools, &call, &mut sink).await
             };
             emit(AgentEvent::ToolExecutionEnd {
                 turn,
@@ -464,10 +463,18 @@ async fn run_loop<M: CustomMessage + Send + 'static>(driver: RunLoop<M>) {
     }
 }
 
-/// The reply's tool calls as owned `(id, name, arguments)` tuples, in model
-/// order. Owning them frees the reply so history can be mutated during the
-/// batch without a live borrow.
-fn tool_calls_of(message: &AssistantMessage) -> Vec<(String, String, Value)> {
+/// One model-requested call, lifted out of the reply into owned fields so the
+/// batch can run while history is mutated without holding a borrow on the
+/// message.
+struct ToolCall {
+    id: String,
+    name: String,
+    arguments: Value,
+}
+
+/// The reply's tool calls in model order, each lifted into an owned
+/// [`ToolCall`].
+fn tool_calls_of(message: &AssistantMessage) -> Vec<ToolCall> {
     message
         .tool_calls()
         .filter_map(|part| match part {
@@ -475,7 +482,11 @@ fn tool_calls_of(message: &AssistantMessage) -> Vec<(String, String, Value)> {
                 id,
                 name,
                 arguments,
-            } => Some((id.clone(), name.clone(), arguments.clone())),
+            } => Some(ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            }),
             _ => None,
         })
         .collect()
@@ -490,42 +501,37 @@ fn tool_calls_of(message: &AssistantMessage) -> Vec<(String, String, Value)> {
 /// (operator detail is dropped here; a logging seam lands later).
 async fn run_one_call(
     tools: &[Arc<dyn ErasedTool>],
-    call_id: &str,
-    name: &str,
-    arguments: Value,
+    call: &ToolCall,
     sink: &mut UpdateSink<'_>,
 ) -> ToolResultMessage {
-    let Some(tool) = tools.iter().find(|t| t.name() == name) else {
+    let Some(tool) = tools.iter().find(|t| t.name() == call.name) else {
         return tool_result(
-            call_id,
-            name,
-            vec![ContentPart::text(format!("unknown tool `{name}`"))],
+            call,
+            vec![ContentPart::text(format!("unknown tool `{}`", call.name))],
             true,
         );
     };
 
-    let ctx = ToolCtx::new(call_id);
-    match tool.invoke(arguments, &ctx, sink).await {
-        Ok(output) => tool_result(call_id, name, output.content, false),
+    let ctx = ToolCtx::new(&call.id);
+    match tool.invoke(call.arguments.clone(), &ctx, sink).await {
+        Ok(output) => tool_result(call, output.content, false),
         Err(error) => tool_result(
-            call_id,
-            name,
+            call,
             vec![ContentPart::text(error.model_message)],
             true,
         ),
     }
 }
 
-/// Assemble a [`ToolResultMessage`] answering `call_id`.
+/// Assemble a [`ToolResultMessage`] answering `call`.
 fn tool_result(
-    call_id: &str,
-    name: &str,
+    call: &ToolCall,
     content: Vec<ContentPart>,
     is_error: bool,
 ) -> ToolResultMessage {
     ToolResultMessage {
-        tool_call_id: call_id.to_owned(),
-        tool_name: name.to_owned(),
+        tool_call_id: call.id.clone(),
+        tool_name: call.name.clone(),
         content,
         is_error,
     }
