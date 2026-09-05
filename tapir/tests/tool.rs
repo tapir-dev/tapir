@@ -230,3 +230,53 @@ fn emits_canonical_portable_schema() {
     });
     assert_eq!(schema, expected, "schema drifted from golden");
 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct Coords {
+    lat: f64,
+    lon: f64,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct NestedArgs {
+    /// Precise coordinates.
+    at: Coords,
+}
+
+/// A tool whose args carry a nested struct, to exercise inlined subschemas.
+#[tool]
+/// Pin a location.
+async fn pin(args: NestedArgs) -> String {
+    format!("{},{}", args.at.lat, args.at.lon)
+}
+
+/// The canonical schema drops every `title`, not just the root one: an inlined
+/// nested struct must not leak the `title` schemars stamps on it.
+#[test]
+fn portable_schema_drops_nested_titles() {
+    let schema = ErasedTool::definition(&pin).input_schema;
+    assert!(
+        !has_key(&schema, "title"),
+        "nested `title` leaked into schema: {schema}"
+    );
+    // The nested object was inlined (no `$ref` left behind).
+    assert!(!has_key(&schema, "$ref"), "un-inlined `$ref`: {schema}");
+    let nested = &schema["properties"]["at"];
+    assert_eq!(nested["type"], "object");
+    assert_eq!(nested["properties"]["lat"]["type"], "number");
+}
+
+/// Whether `key` appears anywhere in the JSON value, recursively.
+fn has_key(value: &serde_json::Value, key: &str) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.contains_key(key) || map.values().any(|v| has_key(v, key))
+        }
+        serde_json::Value::Array(items) => {
+            items.iter().any(|v| has_key(v, key))
+        }
+        _ => false,
+    }
+}

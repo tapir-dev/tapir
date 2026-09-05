@@ -9,9 +9,7 @@ pub use crate::agent::{Agent, Run, RunHandle};
 pub use crate::error::{Error, Result};
 pub use crate::event::AgentEvent;
 pub use crate::store::SessionStore;
-pub use crate::tool::{
-    Concurrency, ErasedTool, Tool, ToolCtx, ToolError, ToolOutput, ToolUpdate,
-};
+pub use crate::tool::{Tool, ToolError, ToolOutput};
 pub use tapir_macros::tool;
 
 // Provider essentials, so the quick-start needs no second dependency.
