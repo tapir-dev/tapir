@@ -20,6 +20,8 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tapir_provider::{ContentPart, ToolDefinition};
 
+use crate::cancel::Cancel;
+
 /// The concurrency class governing how a batch of tool calls executes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -32,23 +34,55 @@ pub enum Concurrency {
 
 /// Per-call context handed to [`Tool::execute`].
 ///
-/// A `ctx` parameter on a `#[tool]` fn is what makes the tool contextual. For
-/// now it carries the call id; the run-loop ticket grows it into the seam for
-/// cancellation and a handle back to the agent and session.
+/// A `ctx` parameter on a `#[tool]` fn is what makes the tool contextual. It
+/// carries the call id and the cancellation seam; a later ticket grows it into a
+/// handle back to the agent and session.
 pub struct ToolCtx {
     id: String,
+    cancel: Cancel,
 }
 
 impl ToolCtx {
-    /// Build a context for a call, identified by the model-supplied call id.
+    /// Build a context for a call, identified by the model-supplied call id. The
+    /// context is un-cancellable — the run loop wires the live batch token
+    /// internally; this plain constructor suits standalone tool tests.
     pub fn new(call_id: impl Into<String>) -> Self {
-        Self { id: call_id.into() }
+        Self {
+            id: call_id.into(),
+            cancel: Cancel::never(),
+        }
+    }
+
+    /// Build a context wired to a live batch's cancellation token.
+    pub(crate) fn with_cancel(
+        call_id: impl Into<String>,
+        cancel: Cancel,
+    ) -> Self {
+        Self {
+            id: call_id.into(),
+            cancel,
+        }
     }
 
     /// The id of the tool call this context serves.
     #[must_use]
     pub fn call_id(&self) -> &str {
         &self.id
+    }
+
+    /// Whether this call's batch has been cancelled. A cheap, non-blocking poll a
+    /// long-running tool can check between steps to bail early.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    /// Resolves when this call's batch is cancelled. A tool with a blocking wait
+    /// can `select!` on this to abort cooperatively; the executor also aborts the
+    /// task itself, so a tool that ignores this is still dropped at its next
+    /// await.
+    pub async fn cancelled(&self) {
+        self.cancel.cancelled().await;
     }
 }
 
