@@ -10,6 +10,7 @@
 //! are in place; the behaviour lands in later tickets.
 
 pub mod agent;
+mod cancel;
 pub mod error;
 pub mod event;
 pub mod message;

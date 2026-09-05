@@ -5,8 +5,11 @@
 //! conversation history and drives runs. Each run is a hybrid kernel: an async
 //! driver (`run_loop`) owns the IO, while the pure `step` function decides the
 //! turn-to-turn transition and is unit-testable with no async or IO. The driver
-//! runs a tool-requesting turn's batch sequentially, feeding each result back
-//! into history; cancellation and steering land in later tickets.
+//! runs a tool-requesting turn's batch through the concurrency-classed scheduler
+//! (`execute_batch`): consecutive `Safe` calls run concurrently while each
+//! `Exclusive` call serializes behind a barrier, and results are assembled back
+//! in model order before feeding history. Steering lands in a later ticket; the
+//! cancellation seam is scaffolded here for the abort ticket to drive.
 
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
@@ -23,12 +26,13 @@ use tapir_provider::{
 };
 use tokio::sync::{broadcast, mpsc};
 
+use crate::cancel::{Cancel, cancel_pair};
 use crate::error::Error;
 use crate::event::AgentEvent;
 use crate::message::{
     AgentMessage, CustomMessage, NoCustom, TransformContext, convert_to_llm,
 };
-use crate::tool::{ErasedTool, Tool, ToolCtx, UpdateSink};
+use crate::tool::{Concurrency, ErasedTool, Tool, ToolCtx};
 
 /// Default cap on tool-requesting turns before a run fails with
 /// [`Error::MaxIterations`].
@@ -330,11 +334,17 @@ async fn run_loop<M: CustomMessage + Send + 'static>(driver: RunLoop<M>) {
     // tool set is fixed for the run.
     let tool_defs: Vec<ToolDefinition> =
         tools.iter().map(|t| t.definition()).collect();
-    // Fan each event out both the per-run stream and the session broadcast.
-    let emit = |ev: AgentEvent| {
-        let _ = bcast.send(ev.clone());
-        let _ = tx.send(ev);
-    };
+    // Fan each event out both the per-run stream and the session broadcast. The
+    // `Emitter` is cloneable so a spawned tool task can emit from its own task;
+    // `emit` is the driver-body shorthand that borrows it.
+    let emitter = Emitter { tx, bcast };
+    let emit = |ev: AgentEvent| emitter.emit(ev);
+
+    // One cancellation token spans the run. Held here for the run's lifetime so
+    // it outlives every batch; the abort ticket wires the trigger onto the
+    // `RunHandle`. Until then the trigger never fires, so the run is effectively
+    // un-cancellable and `execute_batch` always completes.
+    let (_cancel_trigger, cancel) = cancel_pair();
 
     emit(AgentEvent::AgentStart { run });
 
@@ -419,35 +429,34 @@ async fn run_loop<M: CustomMessage + Send + 'static>(driver: RunLoop<M>) {
             }
         }
 
-        // Drain the batch sequentially, in the model's order. Each call runs
-        // through the erased tool's `invoke` boundary; its result (success or
-        // an `is_error` failure) is appended to history so the next turn
-        // re-prompts on it. A bad-arg or author error is a `ToolResult`, never
-        // a `tapir::Error`, so the run continues within the cap.
-        for call in tool_calls_of(&message) {
-            emit(AgentEvent::ToolExecutionStart {
-                turn,
-                call_id: call.id.clone(),
-                name: call.name.clone(),
-            });
-            let result = {
-                let mut sink = |update| {
-                    emit(AgentEvent::ToolExecutionUpdate {
-                        turn,
-                        call_id: call.id.clone(),
-                        update,
-                    });
-                };
-                run_one_call(&tools, &call, &mut sink).await
-            };
-            emit(AgentEvent::ToolExecutionEnd {
-                turn,
-                result: result.clone(),
-            });
-            messages
-                .lock()
-                .expect("history mutex poisoned")
-                .push(AgentMessage::Llm(Message::ToolResult(result)));
+        // Run the batch through the concurrency-classed scheduler: consecutive
+        // `Safe` calls run concurrently, each `Exclusive` call serializes behind
+        // a barrier, and results come back in the model's order. Each result
+        // (success or an `is_error` failure) is appended to history so the next
+        // turn re-prompts on it; a bad-arg or author error is a `ToolResult`,
+        // never a `tapir::Error`, so the run continues within the cap.
+        let batch_ctx = BatchCtx {
+            turn,
+            emitter: emitter.clone(),
+            cancel: cancel.clone(),
+        };
+        match execute_batch(&tools, &tool_calls_of(&message), &batch_ctx).await
+        {
+            BatchOutcome::Completed(results) => {
+                let mut guard =
+                    messages.lock().expect("history mutex poisoned");
+                for result in results {
+                    guard.push(AgentMessage::Llm(Message::ToolResult(result)));
+                }
+            }
+            BatchOutcome::Cancelled => {
+                // The abort ticket owns terminal handling; until it lands the
+                // trigger never fires, so this arm is unreachable in a live run.
+                break Err(Error::Provider(tapir_provider::Error::new(
+                    tapir_provider::ErrorKind::Other,
+                    "run cancelled",
+                )));
+            }
         }
 
         emit(AgentEvent::TurnEnd { turn });
@@ -465,7 +474,8 @@ async fn run_loop<M: CustomMessage + Send + 'static>(driver: RunLoop<M>) {
 
 /// One model-requested call, lifted out of the reply into owned fields so the
 /// batch can run while history is mutated without holding a borrow on the
-/// message.
+/// message. `Clone` so each spawned call task owns its copy.
+#[derive(Clone)]
 struct ToolCall {
     id: String,
     name: String,
@@ -492,35 +502,214 @@ fn tool_calls_of(message: &AssistantMessage) -> Vec<ToolCall> {
         .collect()
 }
 
-/// Run a single tool call through the dispatch boundary and shape the outcome
+/// Fans a run's events onto both the per-run stream and the session broadcast.
+/// Cloneable and `Send` so a spawned tool task emits from its own task.
+#[derive(Clone)]
+struct Emitter {
+    tx: mpsc::UnboundedSender<AgentEvent>,
+    bcast: broadcast::Sender<AgentEvent>,
+}
+
+impl Emitter {
+    /// Send one event to both sinks; a closed receiver is not an error here.
+    fn emit(&self, ev: AgentEvent) {
+        let _ = self.bcast.send(ev.clone());
+        let _ = self.tx.send(ev);
+    }
+}
+
+/// The outcome of running one turn's tool batch.
+enum BatchOutcome {
+    /// Every call ran; results are in the model's order.
+    Completed(Vec<ToolResultMessage>),
+    /// Cancellation fired mid-batch: queued calls were never launched and
+    /// in-flight calls were aborted, so no orphaned work remains.
+    Cancelled,
+}
+
+/// The shared, cloneable context every call in one turn's batch carries: the
+/// turn index it belongs to, the event sink, and the cancellation token. Bundled
+/// so it threads through the scheduler and into each spawned call as one value.
+#[derive(Clone)]
+struct BatchCtx {
+    turn: usize,
+    emitter: Emitter,
+    cancel: Cancel,
+}
+
+/// Run one turn's tool batch under its concurrency classes and return the
+/// results in model order.
+///
+/// The batch is walked in model order and split into waves: a maximal run of
+/// consecutive [`Safe`](Concurrency::Safe) calls forms one wave that executes
+/// concurrently, while each [`Exclusive`](Concurrency::Exclusive) call is its own
+/// solo wave — a barrier that waits for everything before it and blocks
+/// everything after. An unknown-tool call is treated as `Safe`: it runs no author
+/// code, only mints a synthetic `is_error` result, so it never needs a barrier.
+///
+/// Each wave is spawned and joined; if `cancel` fires while a wave is in flight,
+/// its tasks are aborted (the cascade) and no later wave is launched, yielding
+/// [`BatchOutcome::Cancelled`]. Regardless of completion order, results are
+/// placed back at each call's original index.
+async fn execute_batch(
+    tools: &Arc<Vec<Arc<dyn ErasedTool>>>,
+    calls: &[ToolCall],
+    ctx: &BatchCtx,
+) -> BatchOutcome {
+    let mut results: Vec<Option<ToolResultMessage>> = vec![None; calls.len()];
+
+    let mut i = 0;
+    while i < calls.len() {
+        // A cancel that fired between waves stops us before launching the next.
+        if ctx.cancel.is_cancelled() {
+            return BatchOutcome::Cancelled;
+        }
+
+        // Carve the next wave: consecutive `Safe` calls batch together; anything
+        // else (Exclusive, or an unknown tool defaulting to its own wave) runs
+        // alone as a barrier.
+        let start = i;
+        if class_of(tools, &calls[i]) == Concurrency::Safe {
+            while i < calls.len()
+                && class_of(tools, &calls[i]) == Concurrency::Safe
+            {
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+
+        let wave: Vec<usize> = (start..i).collect();
+        let handles: Vec<_> = wave
+            .iter()
+            .map(|&idx| {
+                let tool = resolve(tools, &calls[idx].name);
+                tokio::spawn(run_call(tool, calls[idx].clone(), ctx.clone()))
+            })
+            .collect();
+        let aborts: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
+
+        tokio::select! {
+            biased;
+            () = ctx.cancel.cancelled() => {
+                // Cascade: abort every in-flight call in this wave and launch no
+                // more, leaving no orphaned tool work behind.
+                for abort in &aborts {
+                    abort.abort();
+                }
+                return BatchOutcome::Cancelled;
+            }
+            outputs = collect_wave(handles) => {
+                for (&idx, output) in wave.iter().zip(outputs) {
+                    // A join error here is a panicking tool (aborts are handled on
+                    // the cancel arm above): surface it as an `is_error` result so
+                    // one bad tool does not sink the whole run.
+                    results[idx] = Some(output.unwrap_or_else(|_| {
+                        tool_result(
+                            &calls[idx],
+                            vec![ContentPart::text(format!(
+                                "tool `{}` panicked",
+                                calls[idx].name
+                            ))],
+                            true,
+                        )
+                    }));
+                }
+            }
+        }
+    }
+
+    BatchOutcome::Completed(
+        results
+            .into_iter()
+            .map(|r| r.expect("every call ran"))
+            .collect(),
+    )
+}
+
+/// Await a wave's spawned calls, collecting their join results in launch order.
+/// The tasks run concurrently (they are already spawned); this only harvests
+/// them. Kept separate so the caller's `select!` has one future to join on.
+async fn collect_wave(
+    handles: Vec<tokio::task::JoinHandle<ToolResultMessage>>,
+) -> Vec<Result<ToolResultMessage, tokio::task::JoinError>> {
+    let mut outputs = Vec::with_capacity(handles.len());
+    for handle in handles {
+        outputs.push(handle.await);
+    }
+    outputs
+}
+
+/// The concurrency class of a call's tool, or [`Safe`](Concurrency::Safe) for an
+/// unknown tool (which runs no author code).
+fn class_of(tools: &[Arc<dyn ErasedTool>], call: &ToolCall) -> Concurrency {
+    resolve(tools, &call.name)
+        .map_or(Concurrency::Safe, |tool| tool.concurrency())
+}
+
+/// Find a registered tool by name, cloning the `Arc` for a spawned task.
+fn resolve(
+    tools: &[Arc<dyn ErasedTool>],
+    name: &str,
+) -> Option<Arc<dyn ErasedTool>> {
+    tools.iter().find(|t| t.name() == name).cloned()
+}
+
+/// Run a single tool call end to end: bracket it with `ToolExecution*` events,
+/// dispatch through the erased tool's `invoke` boundary, and shape the outcome
 /// into a [`ToolResultMessage`] to feed back to the model.
 ///
 /// Every path yields a result rather than an error: an unknown tool produces a
-/// synthetic `is_error` result in model order, and a bad-arg or author failure
-/// rides back as an `is_error` result carrying only the model-visible message
-/// (operator detail is dropped here; a logging seam lands later).
-async fn run_one_call(
-    tools: &[Arc<dyn ErasedTool>],
-    call: &ToolCall,
-    sink: &mut UpdateSink<'_>,
+/// synthetic `is_error` result, and a bad-arg or author failure rides back as an
+/// `is_error` result carrying only the model-visible message (operator detail is
+/// dropped here; a logging seam lands later).
+async fn run_call(
+    tool: Option<Arc<dyn ErasedTool>>,
+    call: ToolCall,
+    ctx: BatchCtx,
 ) -> ToolResultMessage {
-    let Some(tool) = tools.iter().find(|t| t.name() == call.name) else {
-        return tool_result(
-            call,
+    let BatchCtx {
+        turn,
+        emitter,
+        cancel,
+    } = ctx;
+    emitter.emit(AgentEvent::ToolExecutionStart {
+        turn,
+        call_id: call.id.clone(),
+        name: call.name.clone(),
+    });
+
+    let result = match tool {
+        None => tool_result(
+            &call,
             vec![ContentPart::text(format!("unknown tool `{}`", call.name))],
             true,
-        );
+        ),
+        Some(tool) => {
+            let ctx = ToolCtx::with_cancel(&call.id, cancel);
+            let mut sink = |update| {
+                emitter.emit(AgentEvent::ToolExecutionUpdate {
+                    turn,
+                    call_id: call.id.clone(),
+                    update,
+                });
+            };
+            match tool.invoke(call.arguments.clone(), &ctx, &mut sink).await {
+                Ok(output) => tool_result(&call, output.content, false),
+                Err(error) => tool_result(
+                    &call,
+                    vec![ContentPart::text(error.model_message)],
+                    true,
+                ),
+            }
+        }
     };
 
-    let ctx = ToolCtx::new(&call.id);
-    match tool.invoke(call.arguments.clone(), &ctx, sink).await {
-        Ok(output) => tool_result(call, output.content, false),
-        Err(error) => tool_result(
-            call,
-            vec![ContentPart::text(error.model_message)],
-            true,
-        ),
-    }
+    emitter.emit(AgentEvent::ToolExecutionEnd {
+        turn,
+        result: result.clone(),
+    });
+    result
 }
 
 /// Assemble a [`ToolResultMessage`] answering `call`.
@@ -539,7 +728,14 @@ fn tool_result(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+
     use super::*;
+    use crate::cancel::cancel_pair;
+    use crate::tool::{ToolError, UpdateSink};
 
     fn state(tool_iterations: usize, max: usize) -> LoopState {
         LoopState {
@@ -576,5 +772,165 @@ mod tests {
         assert_eq!(step(&state(0, 0), true), Next::MaxIterations { limit: 0 });
         // A tool-free reply still finishes even with a zero cap.
         assert_eq!(step(&state(0, 0), false), Next::Finish);
+    }
+
+    /// A `Safe` tool that flags when it starts, then parks forever — so the only
+    /// way it ever stops is the executor aborting its task.
+    struct Blocker {
+        started: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Tool for Blocker {
+        type Args = ();
+        type Output = ();
+        type Error = ToolError;
+
+        fn name(&self) -> &str {
+            "blocker"
+        }
+        fn description(&self) -> &str {
+            "parks until aborted"
+        }
+        fn concurrency(&self) -> Concurrency {
+            Concurrency::Safe
+        }
+
+        async fn execute(
+            &self,
+            (): (),
+            _ctx: &ToolCtx,
+            _on_update: &mut UpdateSink<'_>,
+        ) -> Result<(), ToolError> {
+            self.started.store(true, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+            // Unreachable while aborted; flips only if the task were allowed to
+            // run to completion.
+            self.finished.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// An `Exclusive` tool that records whether it was ever invoked.
+    struct Marker {
+        ran: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Tool for Marker {
+        type Args = ();
+        type Output = ();
+        type Error = ToolError;
+
+        fn name(&self) -> &str {
+            "marker"
+        }
+        fn description(&self) -> &str {
+            "records that it ran"
+        }
+        fn concurrency(&self) -> Concurrency {
+            Concurrency::Exclusive
+        }
+
+        async fn execute(
+            &self,
+            (): (),
+            _ctx: &ToolCtx,
+            _on_update: &mut UpdateSink<'_>,
+        ) -> Result<(), ToolError> {
+            self.ran.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments: Value::Null,
+        }
+    }
+
+    fn test_emitter() -> Emitter {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (bcast, _) = broadcast::channel(64);
+        Emitter { tx, bcast }
+    }
+
+    fn test_ctx(cancel: Cancel) -> BatchCtx {
+        BatchCtx {
+            turn: 0,
+            emitter: test_emitter(),
+            cancel,
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_aborts_inflight_and_skips_queued() {
+        let started = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let ran_after = Arc::new(AtomicBool::new(false));
+
+        let tools: Arc<Vec<Arc<dyn ErasedTool>>> = Arc::new(vec![
+            Arc::new(Blocker {
+                started: started.clone(),
+                finished: finished.clone(),
+            }),
+            Arc::new(Marker {
+                ran: ran_after.clone(),
+            }),
+        ]);
+        // A `Safe` call in flight, then an `Exclusive` call queued behind its
+        // barrier so it only launches after the blocker's wave settles.
+        let calls = vec![call("c1", "blocker"), call("c2", "marker")];
+
+        let (trigger, cancel) = cancel_pair();
+        let ctx = test_ctx(cancel);
+        let batch =
+            tokio::spawn(
+                async move { execute_batch(&tools, &calls, &ctx).await },
+            );
+
+        // Cancel only once the blocker is genuinely in flight.
+        while !started.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        trigger.cancel();
+
+        let outcome = batch.await.expect("batch task");
+        assert!(matches!(outcome, BatchOutcome::Cancelled));
+        assert!(
+            !finished.load(Ordering::SeqCst),
+            "the in-flight call must be aborted, not run to completion"
+        );
+        assert!(
+            !ran_after.load(Ordering::SeqCst),
+            "the queued call behind the barrier must never launch"
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_results_are_in_model_order() {
+        // Two `Exclusive` calls to the same tool: each is its own barrier, yet
+        // the results still come back keyed to the model's order.
+        let tools: Arc<Vec<Arc<dyn ErasedTool>>> =
+            Arc::new(vec![Arc::new(Marker {
+                ran: Arc::new(AtomicBool::new(false)),
+            })]);
+        let calls = vec![call("first", "marker"), call("second", "marker")];
+
+        let (_trigger, cancel) = cancel_pair();
+        let ctx = test_ctx(cancel);
+        let outcome = execute_batch(&tools, &calls, &ctx).await;
+
+        match outcome {
+            BatchOutcome::Completed(results) => {
+                let ids: Vec<&str> =
+                    results.iter().map(|r| r.tool_call_id.as_str()).collect();
+                assert_eq!(ids, ["first", "second"]);
+            }
+            BatchOutcome::Cancelled => panic!("batch was not cancelled"),
+        }
     }
 }
