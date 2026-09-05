@@ -26,8 +26,8 @@ models = ["tapir-provider/models"]
 token-store-file = ["tapir-provider/token-store-file"]
 store-file = ["dep:fs4"]
 
-# Workspace-pinned per the crate skeleton spec, but not yet referenced by the
-# empty module tree; wired in by the tickets that build the run loop, tool
-# system, and file store.
+# Workspace-pinned per the crate skeleton spec but not yet referenced by the
+# module tree; wired in by the tickets that build the tool system and file
+# store. `async-trait` is used only by test fakes that impl `Provider`.
 [package.metadata.cargo-machete]
-ignored = ["async-trait", "futures-core", "futures-util", "schemars", "tokio", "fs4"]
+ignored = ["async-trait", "schemars", "fs4"]
