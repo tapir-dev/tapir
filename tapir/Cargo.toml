@@ -28,8 +28,3 @@ store-file = ["dep:fs4"]
 
 [dev-dependencies]
 trybuild = "1.0"
-
-# `fs4` is gated behind `store-file` and wired in by the file-store ticket; it
-# is not yet referenced by the module tree.
-[package.metadata.cargo-machete]
-ignored = ["fs4"]
