@@ -12,13 +12,16 @@
 //! `Args` and normalizes any author error into a framework [`ToolError`].
 
 use std::error::Error as StdError;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use schemars::generate::{SchemaGenerator, SchemaSettings};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tapir_provider::{ContentPart, ToolDefinition};
+use tapir_provider::{ContentPart, ToolDefinition, ToolResultMessage};
 
 use crate::cancel::Cancel;
 
@@ -323,6 +326,42 @@ impl<T: Tool> ErasedTool for T {
     }
 }
 
+/// One model-requested tool call, lifted out of the reply into owned fields so
+/// the batch can run while history is mutated without holding a borrow on the
+/// message. `Clone` so each spawned call task owns its copy.
+///
+/// Handed by reference to the [`before_tool_call`](crate::agent::AgentBuilder::before_tool_call)
+/// gate and the [`after_tool_call`](crate::agent::AgentBuilder::after_tool_call)
+/// observer; the fields are read through [`id`](Self::id), [`name`](Self::name),
+/// and [`arguments`](Self::arguments).
+#[derive(Clone, Debug)]
+pub struct ToolCall {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) arguments: Value,
+}
+
+impl ToolCall {
+    /// The model-supplied id of this call, stable across the call's lifetime.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The name of the tool the model asked to invoke.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The call's arguments, as the raw JSON the model produced (or the
+    /// rewritten value a [`ToolDecision::Modify`] installed).
+    #[must_use]
+    pub fn arguments(&self) -> &Value {
+        &self.arguments
+    }
+}
+
 /// The decision returned by the pre-batch approval gate for a single call.
 #[non_exhaustive]
 pub enum ToolDecision {
@@ -339,6 +378,30 @@ pub enum ToolDecision {
         message: String,
     },
 }
+
+/// A boxed future whose borrow of the hook's argument is scoped to `'a`. The
+/// hook signatures are HRTB (`for<'a>`) so a closure may borrow the call (and
+/// result) it is handed straight into the returned future without cloning.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// The pre-batch tool-call approval gate. Awaited once per call in model order
+/// before the batch executes — and so before the concurrency window opens, so a
+/// human wait never holds a concurrency slot. Returns a [`ToolDecision`] that
+/// [`Proceed`](ToolDecision::Proceed)s, [`Modify`](ToolDecision::Modify)s the
+/// arguments, or [`Deny`](ToolDecision::Deny)s the call. `None` on the builder
+/// is a no-op that admits every call.
+pub type BeforeToolCall = Arc<
+    dyn for<'a> Fn(&'a ToolCall) -> BoxFuture<'a, ToolDecision> + Send + Sync,
+>;
+
+/// The post-batch, observe-only tool-result hook. Awaited once per executed
+/// result (never for a gate-denied call), in model order, after the batch
+/// settles. `None` on the builder is a no-op.
+pub type AfterToolCall = Arc<
+    dyn for<'a> Fn(&'a ToolCall, &'a ToolResultMessage) -> BoxFuture<'a, ()>
+        + Send
+        + Sync,
+>;
 
 /// Derive the canonical, portable schema for `T`.
 ///

@@ -27,7 +27,6 @@ use std::time::Duration;
 
 use futures_core::Stream;
 use futures_util::StreamExt;
-use serde_json::Value;
 use tapir_provider::{
     AssistantMessage, CompletionOptions, ContentPart, Context, Message,
     Provider, StreamAccumulator, ToolDefinition, ToolResultMessage,
@@ -41,7 +40,10 @@ use crate::message::{
     AgentMessage, CustomMessage, NoCustom, TransformContext, convert_to_llm,
 };
 use crate::store::SessionStore;
-use crate::tool::{Concurrency, ErasedTool, Tool, ToolCtx};
+use crate::tool::{
+    AfterToolCall, BeforeToolCall, Concurrency, ErasedTool, Tool, ToolCall,
+    ToolCtx, ToolDecision,
+};
 
 /// Default cap on tool-requesting turns before a run fails with
 /// [`Error::MaxIterations`].
@@ -183,6 +185,8 @@ pub struct AgentBuilder<M = NoCustom> {
     max_tool_iterations: usize,
     idle_timeout: Option<Duration>,
     tools: Vec<Arc<dyn ErasedTool>>,
+    before_tool_call: Option<BeforeToolCall>,
+    after_tool_call: Option<AfterToolCall>,
     store: Option<Arc<dyn SessionStore<M>>>,
     _marker: std::marker::PhantomData<fn() -> M>,
 }
@@ -195,6 +199,8 @@ impl<M> Default for AgentBuilder<M> {
             max_tool_iterations: DEFAULT_MAX_TOOL_ITERATIONS,
             idle_timeout: None,
             tools: Vec::new(),
+            before_tool_call: None,
+            after_tool_call: None,
             store: None,
             _marker: std::marker::PhantomData,
         }
@@ -264,6 +270,48 @@ impl<M> AgentBuilder<M> {
         self
     }
 
+    /// Install the pre-batch tool-call approval gate. Awaited once per call in
+    /// model order before the turn's batch runs — and so before the concurrency
+    /// window opens, so a human wait (the gate awaiting its own UI) holds no
+    /// concurrency slot and stalls no barrier. The closure returns a
+    /// [`ToolDecision`]: [`Proceed`](ToolDecision::Proceed) runs the call
+    /// silently, [`Modify`](ToolDecision::Modify) reruns arg validation with
+    /// rewritten arguments, and [`Deny`](ToolDecision::Deny) skips execution,
+    /// feeding the model a synthetic `is_error` result plus an
+    /// [`AgentEvent::ToolCallDenied`].
+    /// Unset (the default) admits every call. An abort drops a pending gate
+    /// future with no grace.
+    #[must_use]
+    pub fn before_tool_call<F>(mut self, gate: F) -> Self
+    where
+        F: for<'a> Fn(&'a ToolCall) -> crate::tool::BoxFuture<'a, ToolDecision>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.before_tool_call = Some(Arc::new(gate));
+        self
+    }
+
+    /// Install the post-batch, observe-only tool-result hook. Awaited once per
+    /// executed result (never for a gate-denied call), in model order, after the
+    /// batch settles. It cannot change the result — it only observes. Unset (the
+    /// default) is a no-op.
+    #[must_use]
+    pub fn after_tool_call<F>(mut self, observer: F) -> Self
+    where
+        F: for<'a> Fn(
+                &'a ToolCall,
+                &'a tapir_provider::ToolResultMessage,
+            ) -> crate::tool::BoxFuture<'a, ()>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.after_tool_call = Some(Arc::new(observer));
+        self
+    }
+
     /// Attach a [`SessionStore`], making the agent persist history write-through
     /// as a run progresses. Absent (the default) the agent is ephemeral. To
     /// reopen a persisted session, use [`Agent::resume`] instead, which also
@@ -288,6 +336,8 @@ impl<M> AgentBuilder<M> {
             max_tool_iterations: self.max_tool_iterations,
             idle_timeout: self.idle_timeout,
             tools: Arc::new(self.tools),
+            before_tool_call: self.before_tool_call,
+            after_tool_call: self.after_tool_call,
             transform: None,
             store: self.store,
             messages: Arc::new(Mutex::new(Vec::new())),
@@ -310,6 +360,12 @@ pub struct Agent<M = NoCustom> {
     idle_timeout: Option<Duration>,
     /// The registered tools, erased and shared into every run.
     tools: Arc<Vec<Arc<dyn ErasedTool>>>,
+    /// The pre-batch approval gate, shared into every run; `None` admits every
+    /// call.
+    before_tool_call: Option<BeforeToolCall>,
+    /// The post-batch observe-only result hook, shared into every run; `None`
+    /// is a no-op.
+    after_tool_call: Option<AfterToolCall>,
     /// The `transform_context` seam applied to history each turn before
     /// `convert_to_llm`. `None` is the identity (no reshaping); the builder
     /// that installs one lands in a later ticket.
@@ -416,6 +472,8 @@ impl<M: CustomMessage + Clone + Send + Sync + 'static> Agent<M> {
             idle_timeout: self.idle_timeout,
             follow_up,
             tools: self.tools.clone(),
+            before_tool_call: self.before_tool_call.clone(),
+            after_tool_call: self.after_tool_call.clone(),
             transform: self.transform.clone(),
             store: self.store.clone(),
             messages: self.messages.clone(),
@@ -505,6 +563,10 @@ struct RunLoop<M> {
     /// (`prompt`/`resume`).
     follow_up: bool,
     tools: Arc<Vec<Arc<dyn ErasedTool>>>,
+    /// The pre-batch approval gate for this run; `None` admits every call.
+    before_tool_call: Option<BeforeToolCall>,
+    /// The post-batch observe-only result hook for this run; `None` is a no-op.
+    after_tool_call: Option<AfterToolCall>,
     transform: Option<Arc<TransformContext<M>>>,
     store: Option<Arc<dyn SessionStore<M>>>,
     messages: Arc<Mutex<Vec<AgentMessage<M>>>>,
@@ -535,6 +597,8 @@ async fn run_loop<M: CustomMessage + Clone + Send + Sync + 'static>(
         idle_timeout,
         follow_up,
         tools,
+        before_tool_call,
+        after_tool_call,
         transform,
         store,
         messages,
@@ -682,23 +746,64 @@ async fn run_loop<M: CustomMessage + Clone + Send + Sync + 'static>(
             }
         }
 
-        // Run the batch through the concurrency-classed scheduler: consecutive
-        // `Safe` calls run concurrently, each `Exclusive` call serializes behind
-        // a barrier, and results come back in the model's order. Each result
-        // (success or an `is_error` failure) is appended to history so the next
-        // turn re-prompts on it; a bad-arg or author error is a `ToolResult`,
-        // never a `tapir::Error`, so the run continues within the cap.
+        // Gate the batch before it runs: every call passes through
+        // `before_tool_call` sequentially in model order, ahead of the
+        // concurrency window, so a human wait never holds a slot. A denied call
+        // yields a synthetic result in its model-order slot and never executes.
+        let calls = tool_calls_of(&message);
+        let gated = match gate_batch(
+            &before_tool_call,
+            &calls,
+            turn,
+            &emitter,
+            &cancel,
+        )
+        .await
+        {
+            GateOutcome::Decided(gated) => gated,
+            // An abort dropped a pending gate future: terminate the run.
+            GateOutcome::Cancelled => break Err(Error::Cancelled),
+        };
+
+        // Split the gated calls: denied ones already carry a synthetic result;
+        // the rest run through the batch, each remembering its model-order slot.
+        let mut results: Vec<Option<ToolResultMessage>> =
+            vec![None; calls.len()];
+        let mut runnable: Vec<(usize, ToolCall)> = Vec::new();
+        for (idx, verdict) in gated.into_iter().enumerate() {
+            match verdict {
+                GatedCall::Denied(result) => results[idx] = Some(result),
+                GatedCall::Run(call) => runnable.push((idx, call)),
+            }
+        }
+
+        // Run the admitted calls through the concurrency-classed scheduler:
+        // consecutive `Safe` calls run concurrently, each `Exclusive` call
+        // serializes behind a barrier, and results come back in the runnable
+        // slice's order. Each result (success or an `is_error` failure) is
+        // appended to history so the next turn re-prompts on it; a bad-arg or
+        // author error is a `ToolResult`, never a `tapir::Error`, so the run
+        // continues within the cap.
         let batch_ctx = BatchCtx {
             turn,
             emitter: emitter.clone(),
             cancel: cancel.clone(),
         };
-        match execute_batch(&tools, &tool_calls_of(&message), &batch_ctx).await
-        {
-            BatchOutcome::Completed(results) => {
+        let runnable_calls: Vec<ToolCall> =
+            runnable.iter().map(|(_, call)| call.clone()).collect();
+        match execute_batch(&tools, &runnable_calls, &batch_ctx).await {
+            BatchOutcome::Completed(executed) => {
+                // Observe each executed result (never a gate-denied one) in
+                // model order, then place it back in its model-order slot.
+                for ((idx, call), result) in runnable.into_iter().zip(executed)
+                {
+                    observe_result(&after_tool_call, &call, &result).await;
+                    results[idx] = Some(result);
+                }
                 let mut guard =
                     messages.lock().expect("history mutex poisoned");
                 for result in results {
+                    let result = result.expect("every call gated or executed");
                     guard.push(AgentMessage::Llm(Message::ToolResult(result)));
                 }
             }
@@ -893,16 +998,6 @@ async fn park(
     Park::Steered(steered)
 }
 
-/// One model-requested call, lifted out of the reply into owned fields so the
-/// batch can run while history is mutated without holding a borrow on the
-/// message. `Clone` so each spawned call task owns its copy.
-#[derive(Clone)]
-struct ToolCall {
-    id: String,
-    name: String,
-    arguments: Value,
-}
-
 /// The reply's tool calls in model order, each lifted into an owned
 /// [`ToolCall`].
 fn tool_calls_of(message: &AssistantMessage) -> Vec<ToolCall> {
@@ -921,6 +1016,88 @@ fn tool_calls_of(message: &AssistantMessage) -> Vec<ToolCall> {
             _ => None,
         })
         .collect()
+}
+
+/// One call's verdict from the pre-batch gate.
+enum GatedCall {
+    /// The gate denied the call: this synthetic `is_error` result stands in for
+    /// it in model order, and the call never executes.
+    Denied(ToolResultMessage),
+    /// The gate admitted the call (a [`Proceed`](ToolDecision::Proceed), or a
+    /// [`Modify`](ToolDecision::Modify) whose rewritten arguments are already
+    /// folded in): run it through the batch.
+    Run(ToolCall),
+}
+
+/// The outcome of gating a turn's batch.
+enum GateOutcome {
+    /// Every call was decided; verdicts are in model order.
+    Decided(Vec<GatedCall>),
+    /// An abort fired while a gate future was pending: it was dropped with no
+    /// grace and no call executed.
+    Cancelled,
+}
+
+/// Run every call through the `before_tool_call` gate sequentially in model
+/// order, ahead of the concurrency window. `None` admits every call without
+/// awaiting. Each future is raced against `cancel`: an abort drops the pending
+/// gate future with no grace and yields [`GateOutcome::Cancelled`]. A
+/// [`Deny`](ToolDecision::Deny) emits [`AgentEvent::ToolCallDenied`] and mints a
+/// synthetic `is_error` result in the call's slot; a
+/// [`Modify`](ToolDecision::Modify) folds the rewritten arguments into the call
+/// so the batch reruns validation on them.
+async fn gate_batch(
+    before: &Option<BeforeToolCall>,
+    calls: &[ToolCall],
+    turn: usize,
+    emitter: &Emitter,
+    cancel: &Cancel,
+) -> GateOutcome {
+    let mut gated = Vec::with_capacity(calls.len());
+    for call in calls {
+        let decision = match before {
+            None => ToolDecision::Proceed,
+            Some(gate) => tokio::select! {
+                biased;
+                () = cancel.cancelled() => return GateOutcome::Cancelled,
+                decision = gate(call) => decision,
+            },
+        };
+        match decision {
+            ToolDecision::Proceed => gated.push(GatedCall::Run(call.clone())),
+            ToolDecision::Modify { arguments } => {
+                let mut modified = call.clone();
+                modified.arguments = arguments;
+                gated.push(GatedCall::Run(modified));
+            }
+            ToolDecision::Deny { message } => {
+                emitter.emit(AgentEvent::ToolCallDenied {
+                    turn,
+                    id: call.id.clone(),
+                    message: message.clone(),
+                });
+                gated.push(GatedCall::Denied(tool_result(
+                    call,
+                    vec![ContentPart::text(message)],
+                    true,
+                )));
+            }
+        }
+    }
+    GateOutcome::Decided(gated)
+}
+
+/// Hand one executed call and its result to the `after_tool_call` observer, if
+/// one is installed. A no-op when unset; the hook only observes and cannot
+/// change the result.
+async fn observe_result(
+    after: &Option<AfterToolCall>,
+    call: &ToolCall,
+    result: &ToolResultMessage,
+) {
+    if let Some(observer) = after {
+        observer(call, result).await;
+    }
 }
 
 /// Fans a run's events onto both the per-run stream and the session broadcast.
@@ -1153,6 +1330,7 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use serde_json::Value;
 
     use super::*;
     use crate::cancel::cancel_pair;

@@ -98,6 +98,23 @@ pub enum AgentEvent {
         result: ToolResultMessage,
     },
 
+    /// A tool call was rejected by the [`before_tool_call`](crate::agent::AgentBuilder::before_tool_call)
+    /// gate before the batch ran. The call never executed, so it emits no
+    /// `ToolExecution*` events; instead a synthetic `is_error`
+    /// [`ToolResultMessage`] carrying `message` is fed back to the model in the
+    /// call's model-order slot. Emitted during the pre-batch gate pass, so in
+    /// model order but before any
+    /// [`ToolExecutionStart`](Self::ToolExecutionStart): the whole batch is
+    /// gated before any of it runs.
+    ToolCallDenied {
+        /// The turn whose batch this call belonged to.
+        turn: usize,
+        /// The model-supplied id of the denied call.
+        id: String,
+        /// The rejection message surfaced to the model.
+        message: String,
+    },
+
     /// The turn finished: its message settled and any tool batch drained.
     TurnEnd {
         /// The turn that finished.

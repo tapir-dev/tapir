@@ -30,6 +30,16 @@ detail. Terms owned by `tapir-provider` (`Provider`, `Context`, `Message`,
 - **Concurrency class** — `Safe` (parallelizable reads) vs `Exclusive` (serialized
   mutations); governs how a batch of tool calls is executed.
 
+- **Approval gate** — The pre-batch `before_tool_call` seam: a per-call decision
+  awaited in model order before the concurrency window opens, each proceeding,
+  modifying the arguments, or denying the call.
+
+- **Tool decision** — A gate verdict: proceed, modify (rewrite arguments, rerunning
+  validation), or deny (skip execution, feeding the model a synthetic error).
+
+- **After-hook** — The post-batch `after_tool_call` seam: an observe-only pass over
+  executed results (never gate-denied ones), in model order.
+
 - **AgentEvent** — The single flat event type streamed from a run.
 
 - **Session** — One conversation as persisted through a SessionStore.
