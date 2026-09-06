@@ -37,7 +37,12 @@ impl CustomMessage for NoCustom {
 
 /// The SDK's message supertype layered over provider messages, generic over a
 /// custom-message type `M` defaulting to [`NoCustom`].
-#[derive(Debug, Clone)]
+///
+/// Serde is externally tagged (`{"Llm": …}` / `{"Custom": …}`), the wire form a
+/// [`SessionStore`](crate::store::SessionStore) persists one message per line.
+/// The derives bound `M` on `Serialize`/`Deserialize`, so a custom message type
+/// round-trips through a store for free.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentMessage<M = NoCustom> {
     /// A standard message that maps 1:1 to a provider [`Message`].
     Llm(Message),

@@ -32,6 +32,7 @@ use crate::event::AgentEvent;
 use crate::message::{
     AgentMessage, CustomMessage, NoCustom, TransformContext, convert_to_llm,
 };
+use crate::store::SessionStore;
 use crate::tool::{Concurrency, ErasedTool, Tool, ToolCtx};
 
 /// Default cap on tool-requesting turns before a run fails with
@@ -106,6 +107,7 @@ pub struct AgentBuilder<M = NoCustom> {
     system: Option<String>,
     max_tool_iterations: usize,
     tools: Vec<Arc<dyn ErasedTool>>,
+    store: Option<Arc<dyn SessionStore<M>>>,
     _marker: std::marker::PhantomData<fn() -> M>,
 }
 
@@ -116,6 +118,7 @@ impl<M> Default for AgentBuilder<M> {
             system: None,
             max_tool_iterations: DEFAULT_MAX_TOOL_ITERATIONS,
             tools: Vec::new(),
+            store: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -172,6 +175,16 @@ impl<M> AgentBuilder<M> {
         self
     }
 
+    /// Attach a [`SessionStore`], making the agent persist history write-through
+    /// as a run progresses. Absent (the default) the agent is ephemeral. To
+    /// reopen a persisted session, use [`Agent::resume`] instead, which also
+    /// seeds history from the store.
+    #[must_use]
+    pub fn store(mut self, store: Arc<dyn SessionStore<M>>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
     /// Validate the configuration and build the agent. Synchronous: the only
     /// v1 check is that a provider was set. A missing provider is
     /// [`Error::Build`].
@@ -186,7 +199,9 @@ impl<M> AgentBuilder<M> {
             max_tool_iterations: self.max_tool_iterations,
             tools: Arc::new(self.tools),
             transform: None,
+            store: self.store,
             messages: Arc::new(Mutex::new(Vec::new())),
+            persisted: Arc::new(Mutex::new(0)),
             events,
             next_run: AtomicU64::new(0),
             _marker: std::marker::PhantomData,
@@ -206,9 +221,17 @@ pub struct Agent<M = NoCustom> {
     /// `convert_to_llm`. `None` is the identity (no reshaping); the builder
     /// that installs one lands in a later ticket.
     transform: Option<Arc<TransformContext<M>>>,
+    /// The persistence seam. `None` (the default) is ephemeral; when set, each
+    /// run writes history through it as it progresses.
+    store: Option<Arc<dyn SessionStore<M>>>,
     /// History owned behind a mutex so a spawned run appends to the same
     /// history the next `prompt` reads.
     messages: Arc<Mutex<Vec<AgentMessage<M>>>>,
+    /// How many leading messages in `messages` are already durable in `store`.
+    /// The write-through high-water mark: a run appends only the tail beyond it,
+    /// so seeded (resumed) history and messages already written are never
+    /// re-appended. Meaningful only when `store` is set.
+    persisted: Arc<Mutex<usize>>,
     events: broadcast::Sender<AgentEvent>,
     next_run: AtomicU64,
     _marker: std::marker::PhantomData<fn() -> M>,
@@ -222,7 +245,30 @@ impl Agent<NoCustom> {
     }
 }
 
-impl<M: CustomMessage + Send + 'static> Agent<M> {
+impl<M: CustomMessage + Clone + Send + Sync + 'static> Agent<M> {
+    /// Reopen a persisted session: build the agent from `builder`, attach
+    /// `store`, and seed history from what the store has already recorded. The
+    /// returned agent continues the conversation — a following [`prompt`] appends
+    /// to the seeded history and persists write-through as usual.
+    ///
+    /// Async because loading crosses the store's async boundary; a load failure
+    /// fails closed as [`Error::Session`]. The seeded history is exactly what
+    /// `store` returns — resume is the sole seeding path, so it stays mutually
+    /// exclusive with any builder-side message seeding a later ticket adds.
+    ///
+    /// [`prompt`]: Agent::prompt
+    pub async fn resume(
+        builder: AgentBuilder<M>,
+        store: Arc<dyn SessionStore<M>>,
+    ) -> Result<Self, Error> {
+        let history = store.load().await?;
+        let seeded = history.len();
+        let agent = builder.store(store).build()?;
+        *agent.messages.lock().expect("history mutex poisoned") = history;
+        *agent.persisted.lock().expect("persist mark poisoned") = seeded;
+        Ok(agent)
+    }
+
     /// Append a user turn, then run to completion.
     pub fn prompt(&self, input: impl Into<String>) -> Run {
         self.messages
@@ -250,7 +296,9 @@ impl<M: CustomMessage + Send + 'static> Agent<M> {
             max_tool_iterations: self.max_tool_iterations,
             tools: self.tools.clone(),
             transform: self.transform.clone(),
+            store: self.store.clone(),
             messages: self.messages.clone(),
+            persisted: self.persisted.clone(),
             tx,
             bcast: self.events.clone(),
         }));
@@ -308,7 +356,9 @@ struct RunLoop<M> {
     max_tool_iterations: usize,
     tools: Arc<Vec<Arc<dyn ErasedTool>>>,
     transform: Option<Arc<TransformContext<M>>>,
+    store: Option<Arc<dyn SessionStore<M>>>,
     messages: Arc<Mutex<Vec<AgentMessage<M>>>>,
+    persisted: Arc<Mutex<usize>>,
     tx: mpsc::UnboundedSender<AgentEvent>,
     bcast: broadcast::Sender<AgentEvent>,
 }
@@ -318,7 +368,9 @@ struct RunLoop<M> {
 /// `complete_stream` folded through a [`StreamAccumulator`]; the provider
 /// context is built each turn from `transform` then [`convert_to_llm`] under
 /// one lock.
-async fn run_loop<M: CustomMessage + Send + 'static>(driver: RunLoop<M>) {
+async fn run_loop<M: CustomMessage + Clone + Send + Sync + 'static>(
+    driver: RunLoop<M>,
+) {
     let RunLoop {
         run,
         provider,
@@ -326,7 +378,9 @@ async fn run_loop<M: CustomMessage + Send + 'static>(driver: RunLoop<M>) {
         max_tool_iterations,
         tools,
         transform,
+        store,
         messages,
+        persisted,
         tx,
         bcast,
     } = driver;
@@ -356,6 +410,13 @@ async fn run_loop<M: CustomMessage + Send + 'static>(driver: RunLoop<M>) {
 
     let outcome: Result<AssistantMessage, Error> = loop {
         emit(AgentEvent::TurnStart { turn });
+
+        // Write-through the pending tail before the provider call — on the first
+        // turn that is the user message this run is answering, so the request is
+        // itself durable. A store error fails the run closed.
+        if let Err(error) = persist_tail(&store, &messages, &persisted).await {
+            break Err(error);
+        }
 
         // Build the provider context under one lock, then drop the guard before
         // any await so the driver future stays `Send`. `transform_context`
@@ -415,6 +476,13 @@ async fn run_loop<M: CustomMessage + Send + 'static>(driver: RunLoop<M>) {
             .expect("history mutex poisoned")
             .push(AgentMessage::Llm(Message::Assistant(message.clone())));
 
+        // Persist the settled reply — an artifact after the call — before the
+        // transition is decided, so it is durable whether the run finishes,
+        // hits the cap, or continues. Fail closed on a store error.
+        if let Err(error) = persist_tail(&store, &messages, &persisted).await {
+            break Err(error);
+        }
+
         let reply_wants_tools = message.tool_calls().next().is_some();
         match step(&state, reply_wants_tools) {
             Next::Finish => {
@@ -459,6 +527,12 @@ async fn run_loop<M: CustomMessage + Send + 'static>(driver: RunLoop<M>) {
             }
         }
 
+        // Persist the batch's tool results — artifacts after the call — before
+        // the next turn re-prompts on them. Fail closed on a store error.
+        if let Err(error) = persist_tail(&store, &messages, &persisted).await {
+            break Err(error);
+        }
+
         emit(AgentEvent::TurnEnd { turn });
         turn += 1;
     };
@@ -469,6 +543,40 @@ async fn run_loop<M: CustomMessage + Send + 'static>(driver: RunLoop<M>) {
             turn: Some(turn),
             error: Arc::new(error),
         }),
+    }
+}
+
+/// Flush any unpersisted tail of history — everything past the `persisted`
+/// high-water mark — to the store, one `append().await` per message, bumping the
+/// mark as each resolves durable. A no-op when the agent is ephemeral (no store).
+///
+/// Called before the provider call (persisting the user turn) and after each
+/// artifact push, so history is durable message by message. A store error
+/// normalizes to [`Error::Session`] for the caller to surface as the terminal
+/// error; the just-pushed message stays only in memory, never seen as durable.
+async fn persist_tail<M: CustomMessage + Clone + Send + Sync + 'static>(
+    store: &Option<Arc<dyn SessionStore<M>>>,
+    messages: &Arc<Mutex<Vec<AgentMessage<M>>>>,
+    persisted: &Arc<Mutex<usize>>,
+) -> Result<(), Error> {
+    let Some(store) = store else {
+        return Ok(());
+    };
+    loop {
+        // Snapshot the next unpersisted message and drop both locks before the
+        // await — the std mutexes never cross an await point.
+        let next = {
+            let guard = messages.lock().expect("history mutex poisoned");
+            let mark = *persisted.lock().expect("persist mark poisoned");
+            guard.get(mark).cloned()
+        };
+        match next {
+            None => return Ok(()),
+            Some(message) => {
+                store.append(&message).await?;
+                *persisted.lock().expect("persist mark poisoned") += 1;
+            }
+        }
     }
 }
 
