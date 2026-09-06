@@ -10,14 +10,20 @@
 //! `Exclusive` call serializes behind a barrier, and results are assembled back
 //! in model order before feeding history. A [`RunHandle`] cloned off the run
 //! controls it from another task: `abort` fires the run's cancellation token
-//! (honored at turn-top and the batch checkpoints), and `steer` injects a user
-//! turn drained at the next `TurnEnd`.
+//! (honored at turn-top and the batch checkpoints), `steer` injects a user turn
+//! drained at the next `TurnEnd`, and `finish` ends a parked follow-up run.
+//!
+//! `prompt`/`resume` runs end at the first tool-free reply. A [`converse`](Agent::converse)
+//! run instead *parks* there: it emits [`AgentEvent::Idle`] and awaits more input,
+//! waking on a steer (which resets the tool-iteration cap) and ending only on
+//! `finish`, an `idle_timeout`, or an abort.
 
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
+use std::time::Duration;
 
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -69,11 +75,9 @@ enum SteerCmd {
         /// How it combines with any pending steer input.
         mode: SteerMode,
     },
-    /// Request the run finish gracefully after the current turn.
-    #[allow(
-        dead_code,
-        reason = "graceful finish is driven by the follow-up ticket"
-    )]
+    /// Request the run finish gracefully: end a parked follow-up run, or, on a
+    /// run still in its turn loop, prevent the next park so it ends at its next
+    /// tool-free reply.
     Finish,
 }
 
@@ -115,6 +119,18 @@ impl RunHandle {
             text: text.into(),
             mode,
         });
+    }
+
+    /// Finish the run gracefully. On a [`converse`](Agent::converse) run parked
+    /// in the idle state (having emitted [`AgentEvent::Idle`]) this ends it at
+    /// once, resolving the run with [`AgentEnd`](AgentEvent::AgentEnd) carrying
+    /// the parked reply. On a run still in its turn loop it is remembered and
+    /// prevents the next park, so the run ends at its next tool-free reply. A
+    /// no-op once the run has terminated, and on a `prompt`/`resume` run (which
+    /// never parks).
+    pub fn finish(&self) {
+        // A closed channel means the run already ended: drop silently.
+        let _ = self.steer.send(SteerCmd::Finish);
     }
 }
 
@@ -165,6 +181,7 @@ pub struct AgentBuilder<M = NoCustom> {
     provider: Option<Arc<dyn Provider>>,
     system: Option<String>,
     max_tool_iterations: usize,
+    idle_timeout: Option<Duration>,
     tools: Vec<Arc<dyn ErasedTool>>,
     store: Option<Arc<dyn SessionStore<M>>>,
     _marker: std::marker::PhantomData<fn() -> M>,
@@ -176,6 +193,7 @@ impl<M> Default for AgentBuilder<M> {
             provider: None,
             system: None,
             max_tool_iterations: DEFAULT_MAX_TOOL_ITERATIONS,
+            idle_timeout: None,
             tools: Vec::new(),
             store: None,
             _marker: std::marker::PhantomData,
@@ -210,6 +228,18 @@ impl<M> AgentBuilder<M> {
     #[must_use]
     pub fn max_tool_iterations(mut self, n: usize) -> Self {
         self.max_tool_iterations = n;
+        self
+    }
+
+    /// Set how long a [`converse`](Agent::converse) run may sit parked in the
+    /// idle state before it ends itself with [`AgentEnd`](AgentEvent::AgentEnd).
+    /// `Some(d)` ends a run left idle for `d` with no steer or
+    /// [`finish`](RunHandle::finish); `None` (the default) parks indefinitely,
+    /// so only `finish` or an abort ends it. No effect on a `prompt`/`resume`
+    /// run, which never parks.
+    #[must_use]
+    pub fn idle_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.idle_timeout = timeout;
         self
     }
 
@@ -256,6 +286,7 @@ impl<M> AgentBuilder<M> {
             provider,
             system: self.system,
             max_tool_iterations: self.max_tool_iterations,
+            idle_timeout: self.idle_timeout,
             tools: Arc::new(self.tools),
             transform: None,
             store: self.store,
@@ -274,6 +305,9 @@ pub struct Agent<M = NoCustom> {
     provider: Arc<dyn Provider>,
     system: Option<String>,
     max_tool_iterations: usize,
+    /// How long a `converse` run parks in the idle state before ending itself;
+    /// `None` parks indefinitely. Ignored by `prompt`/`resume` runs.
+    idle_timeout: Option<Duration>,
     /// The registered tools, erased and shared into every run.
     tools: Arc<Vec<Arc<dyn ErasedTool>>>,
     /// The `transform_context` seam applied to history each turn before
@@ -328,13 +362,30 @@ impl<M: CustomMessage + Clone + Send + Sync + 'static> Agent<M> {
         Ok(agent)
     }
 
-    /// Append a user turn, then run to completion.
+    /// Append a user turn, then run to completion. Terminates at the first
+    /// tool-free reply. For an interactive run that parks awaiting more input,
+    /// use [`converse`](Self::converse) instead.
     pub fn prompt(&self, input: impl Into<String>) -> Run {
         self.messages
             .lock()
             .expect("history mutex poisoned")
             .push(AgentMessage::Llm(Message::user(input)));
-        self.run()
+        self.run(false)
+    }
+
+    /// Append a user turn, then run as an interactive follow-up: instead of
+    /// ending at a tool-free reply, the run parks in the idle state — it emits
+    /// [`AgentEvent::Idle`] and awaits more input. A [`steer`](RunHandle::steer)
+    /// wakes it (resetting the tool-iteration cap) and the loop resumes;
+    /// [`finish`](RunHandle::finish), the builder's
+    /// [`idle_timeout`](AgentBuilder::idle_timeout), or an abort ends it. The
+    /// run's future resolves only once it ends, carrying the final reply.
+    pub fn converse(&self, input: impl Into<String>) -> Run {
+        self.messages
+            .lock()
+            .expect("history mutex poisoned")
+            .push(AgentMessage::Llm(Message::user(input)));
+        self.run(true)
     }
 
     /// Subscribe to this session's events across all runs. Each run's events are
@@ -344,8 +395,11 @@ impl<M: CustomMessage + Clone + Send + Sync + 'static> Agent<M> {
         self.events.subscribe()
     }
 
-    /// Spawn the driver on its own task and hand back the [`Run`].
-    fn run(&self) -> Run {
+    /// Spawn the driver on its own task and hand back the [`Run`]. `follow_up`
+    /// selects interactive parking: `true` (via [`converse`](Self::converse))
+    /// parks at a tool-free reply, `false` (via [`prompt`](Self::prompt))
+    /// terminates there.
+    fn run(&self, follow_up: bool) -> Run {
         let run = RunId(self.next_run.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = mpsc::unbounded_channel();
         // The control surface: one cancellation token and one ordered steer
@@ -359,6 +413,8 @@ impl<M: CustomMessage + Clone + Send + Sync + 'static> Agent<M> {
             provider: self.provider.clone(),
             system: self.system.clone(),
             max_tool_iterations: self.max_tool_iterations,
+            idle_timeout: self.idle_timeout,
+            follow_up,
             tools: self.tools.clone(),
             transform: self.transform.clone(),
             store: self.store.clone(),
@@ -442,6 +498,12 @@ struct RunLoop<M> {
     provider: Arc<dyn Provider>,
     system: Option<String>,
     max_tool_iterations: usize,
+    /// How long to park in the idle state before ending a follow-up run; `None`
+    /// parks indefinitely. Only consulted when `follow_up` is set.
+    idle_timeout: Option<Duration>,
+    /// Whether a tool-free reply parks (interactive `converse`) or ends the run
+    /// (`prompt`/`resume`).
+    follow_up: bool,
     tools: Arc<Vec<Arc<dyn ErasedTool>>>,
     transform: Option<Arc<TransformContext<M>>>,
     store: Option<Arc<dyn SessionStore<M>>>,
@@ -470,6 +532,8 @@ async fn run_loop<M: CustomMessage + Clone + Send + Sync + 'static>(
         provider,
         system,
         max_tool_iterations,
+        idle_timeout,
+        follow_up,
         tools,
         transform,
         store,
@@ -497,6 +561,9 @@ async fn run_loop<M: CustomMessage + Clone + Send + Sync + 'static>(
         max_tool_iterations,
     };
     let mut turn = 0usize;
+    // Sticky: a `finish()` seen mid-run keeps a follow-up run from parking, so it
+    // ends at its next tool-free reply.
+    let mut finish_requested = false;
 
     let outcome: Result<AssistantMessage, Error> = loop {
         // Turn-top abort checkpoint: an abort fired between turns terminates the
@@ -583,7 +650,29 @@ async fn run_loop<M: CustomMessage + Clone + Send + Sync + 'static>(
         match step(&state, reply_wants_tools) {
             Next::Finish => {
                 emit(AgentEvent::TurnEnd { turn });
-                break Ok(message);
+                // A `prompt`/`resume` run ends here, and so does a follow-up run
+                // once `finish` has been requested. Otherwise the follow-up run
+                // parks: it emits `Idle` and awaits the next control signal.
+                if !follow_up || finish_requested {
+                    break Ok(message);
+                }
+                emit(AgentEvent::Idle { run });
+                match park(&mut steer, &cancel, idle_timeout).await {
+                    Park::Steered(steered) => {
+                        // A steer woke the run: inject the folded user turns and
+                        // re-arm the tool budget so the continuation gets a fresh
+                        // cap, then resume with the next turn.
+                        inject_user_turns(&messages, steered);
+                        state.tool_iterations = 0;
+                        turn += 1;
+                        continue;
+                    }
+                    // `finish` or the idle timeout ends the run with the parked
+                    // reply.
+                    Park::Finished | Park::TimedOut => break Ok(message),
+                    // An abort fired while parked: terminate the run.
+                    Park::Cancelled => break Err(Error::Cancelled),
+                }
             }
             Next::MaxIterations { limit } => {
                 break Err(Error::MaxIterations { limit });
@@ -628,14 +717,11 @@ async fn run_loop<M: CustomMessage + Clone + Send + Sync + 'static>(
 
         // TurnEnd steer drain: fold every queued control command, then inject each
         // steered user turn into history so the next turn's provider call picks
-        // them up at the turn boundary.
-        let steered = drain_steer(&mut steer);
-        if !steered.is_empty() {
-            let mut guard = messages.lock().expect("history mutex poisoned");
-            for text in steered {
-                guard.push(AgentMessage::Llm(Message::user(text)));
-            }
-        }
+        // them up at the turn boundary. A queued `finish` is remembered so a
+        // follow-up run ends at its next tool-free reply instead of parking.
+        let (steered, finish) = drain_steer(&mut steer);
+        finish_requested |= finish;
+        inject_user_turns(&messages, steered);
 
         emit(AgentEvent::TurnEnd { turn });
         turn += 1;
@@ -685,27 +771,126 @@ async fn persist_tail<M: CustomMessage + Clone + Send + Sync + 'static>(
 }
 
 /// Drain every command queued on the control channel and fold the steer inputs
-/// into the user turns to inject, in order. The channel is ordered, so folding in
-/// receive order honors the caller's sequence: [`Append`](SteerMode::Append) adds
-/// its text as one more pending turn, while [`Replace`](SteerMode::Replace)
-/// discards whatever is pending and starts over from its text. Purely
-/// non-blocking — it takes only what is already queued and never awaits.
-fn drain_steer(steer: &mut mpsc::UnboundedReceiver<SteerCmd>) -> Vec<String> {
+/// into the user turns to inject, in order, reporting whether a
+/// [`Finish`](SteerCmd::Finish) was among them. The channel is ordered, so
+/// folding in receive order honors the caller's sequence:
+/// [`Append`](SteerMode::Append) adds its text as one more pending turn, while
+/// [`Replace`](SteerMode::Replace) discards whatever is pending and starts over
+/// from its text. Purely non-blocking — it takes only what is already queued and
+/// never awaits.
+fn drain_steer(
+    steer: &mut mpsc::UnboundedReceiver<SteerCmd>,
+) -> (Vec<String>, bool) {
     let mut pending: Vec<String> = Vec::new();
+    let mut finish = false;
     while let Ok(cmd) = steer.try_recv() {
         match cmd {
-            SteerCmd::Input { text, mode } => match mode {
-                SteerMode::Append => pending.push(text),
-                SteerMode::Replace => {
-                    pending.clear();
-                    pending.push(text);
-                }
-            },
-            // Graceful finish is driven by the follow-up ticket; nothing to fold.
-            SteerCmd::Finish => {}
+            SteerCmd::Input { text, mode } => {
+                fold_steer_input(&mut pending, text, mode);
+            }
+            SteerCmd::Finish => finish = true,
         }
     }
-    pending
+    (pending, finish)
+}
+
+/// Fold one steered input into the pending user turns per its [`SteerMode`]:
+/// [`Append`](SteerMode::Append) adds another turn,
+/// [`Replace`](SteerMode::Replace) discards the pending turns and starts over
+/// from this text. Shared by the `TurnEnd` drain and the idle-park wake so both
+/// honor the same `Append`/`Replace` semantics.
+fn fold_steer_input(pending: &mut Vec<String>, text: String, mode: SteerMode) {
+    match mode {
+        SteerMode::Append => pending.push(text),
+        SteerMode::Replace => {
+            pending.clear();
+            pending.push(text);
+        }
+    }
+}
+
+/// Push each steered text into history as its own user turn, under one lock; a
+/// no-op on an empty batch. Shared by the `TurnEnd` drain and the idle-park wake,
+/// which inject folded steer input the same way.
+fn inject_user_turns<M>(
+    messages: &Arc<Mutex<Vec<AgentMessage<M>>>>,
+    turns: Vec<String>,
+) {
+    if turns.is_empty() {
+        return;
+    }
+    let mut guard = messages.lock().expect("history mutex poisoned");
+    for text in turns {
+        guard.push(AgentMessage::Llm(Message::user(text)));
+    }
+}
+
+/// The outcome of parking a follow-up run at a tool-free reply.
+enum Park {
+    /// A steer arrived: inject these folded user turns and resume with a fresh
+    /// tool-iteration cap.
+    Steered(Vec<String>),
+    /// [`finish`](RunHandle::finish) was requested, or every control sender
+    /// dropped: end the run with [`AgentEnd`](AgentEvent::AgentEnd).
+    Finished,
+    /// The idle timeout elapsed with no input: end the run with `AgentEnd`.
+    TimedOut,
+    /// An abort fired while parked: terminate the run with [`Error::Cancelled`].
+    Cancelled,
+}
+
+/// Park a follow-up run in the idle state, awaiting the next control signal.
+///
+/// Resolves when a steer wakes it — folding the waking command with anything
+/// already queued behind it through the shared [`fold_steer_input`], so the
+/// caller's `Append`/`Replace` sequence is honored — or when
+/// [`finish`](RunHandle::finish),
+/// the `idle_timeout`, or an abort ends it. A [`Finish`](SteerCmd::Finish) seen
+/// anywhere in the woken batch ends the run (finish wins over queued input). With
+/// `idle_timeout` `None` the run parks indefinitely, so only `finish` or an abort
+/// ends it. Blocks on [`recv`](mpsc::UnboundedReceiver::recv) rather than the
+/// non-blocking drain the turn loop uses, since a parked run has nothing else to
+/// do until a signal arrives.
+async fn park(
+    steer: &mut mpsc::UnboundedReceiver<SteerCmd>,
+    cancel: &Cancel,
+    idle_timeout: Option<Duration>,
+) -> Park {
+    let sleep = async {
+        match idle_timeout {
+            Some(d) => tokio::time::sleep(d).await,
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::pin!(sleep);
+
+    let first = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Park::Cancelled,
+        cmd = steer.recv() => cmd,
+        () = &mut sleep => return Park::TimedOut,
+    };
+    // Every control sender dropped: no one can steer or finish, so end gracefully
+    // rather than hang the task.
+    let Some(first) = first else {
+        return Park::Finished;
+    };
+
+    // Fold the waking command with everything already queued behind it.
+    let mut cmds = vec![first];
+    while let Ok(cmd) = steer.try_recv() {
+        cmds.push(cmd);
+    }
+    let mut steered: Vec<String> = Vec::new();
+    for cmd in cmds {
+        match cmd {
+            SteerCmd::Finish => return Park::Finished,
+            SteerCmd::Input { text, mode } => {
+                fold_steer_input(&mut steered, text, mode);
+            }
+        }
+    }
+    Park::Steered(steered)
 }
 
 /// One model-requested call, lifted out of the reply into owned fields so the

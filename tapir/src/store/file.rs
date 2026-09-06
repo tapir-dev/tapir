@@ -171,7 +171,7 @@ fn open_locked(path: &Path) -> io::Result<std::fs::File> {
 /// Read the whole log and parse it back into history.
 ///
 /// Missing or empty → `Ok(vec![])`. An unterminated trailing line is an
-/// uncommitted torn write and is dropped. Any other unparseable or unknown-tag
+/// uncommitted torn write and is dropped. Any other unparsable or unknown-tag
 /// line is committed corruption and fails closed with the log left intact.
 fn load_path<M>(path: &Path) -> Result<Vec<AgentMessage<M>>, SessionError>
 where

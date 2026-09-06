@@ -116,6 +116,19 @@ pub enum AgentEvent {
         error: Arc<Error>,
     },
 
+    /// A [`converse`](crate::agent::Agent::converse) run parked at a tool-free
+    /// reply instead of ending, awaiting more input. Not terminal: the run's
+    /// future stays pending. A steer wakes it (resetting the tool-iteration cap)
+    /// and the loop resumes with a fresh [`TurnStart`](Self::TurnStart);
+    /// [`RunHandle::finish`](crate::agent::RunHandle::finish) or the builder's
+    /// `idle_timeout` ends it, resolving the run with
+    /// [`AgentEnd`](Self::AgentEnd). Never emitted by a `prompt`/`resume` run,
+    /// which always ends at a tool-free reply.
+    Idle {
+        /// The run that parked.
+        run: RunId,
+    },
+
     /// The run finished successfully. Terminal item; carries the settled final
     /// reply — the message that stopped without asking for a tool.
     AgentEnd {
