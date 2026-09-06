@@ -10,13 +10,27 @@
 //! ```
 
 #[cfg(feature = "anthropic")]
+use schemars::JsonSchema;
+#[cfg(feature = "anthropic")]
+use serde::Deserialize;
+#[cfg(feature = "anthropic")]
 use tapir::prelude::*;
+
+// A struct argument so the tool's JSON schema is an `object`, as providers
+// require for a tool's input schema.
+#[cfg(feature = "anthropic")]
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct WeatherArgs {
+    /// The city to report the weather for.
+    city: String,
+}
 
 #[cfg(feature = "anthropic")]
 #[tool]
 /// Get the weather for a city.
-async fn weather(city: String) -> String {
-    format!("sunny in {city}")
+async fn weather(args: WeatherArgs) -> String {
+    format!("sunny in {}", args.city)
 }
 
 // The run future yields `Result<_, Arc<tapir::Error>>` and there is no
