@@ -39,6 +39,7 @@ use crate::event::AgentEvent;
 use crate::message::{
     AgentMessage, CustomMessage, NoCustom, TransformContext, convert_to_llm,
 };
+use crate::schema::{NonStrict, SchemaProfile};
 use crate::store::SessionStore;
 use crate::tool::{
     AfterToolCall, BeforeToolCall, Concurrency, ErasedTool, Tool, ToolCall,
@@ -181,12 +182,20 @@ fn step(state: &LoopState, reply_wants_tools: bool) -> Next {
 /// The fluent builder for an [`Agent`]. Build with [`Agent::builder`].
 pub struct AgentBuilder<M = NoCustom> {
     provider: Option<Arc<dyn Provider>>,
+    /// A model id set via [`model`](Self::model), resolved offline at
+    /// [`build`](Self::build) into a provider. Mutually exclusive with
+    /// `provider`. Only settable when a provider feature is compiled in.
+    #[cfg(any(feature = "anthropic", feature = "openai"))]
+    model: Option<String>,
     system: Option<String>,
     max_tool_iterations: usize,
     idle_timeout: Option<Duration>,
     tools: Vec<Arc<dyn ErasedTool>>,
     before_tool_call: Option<BeforeToolCall>,
     after_tool_call: Option<AfterToolCall>,
+    /// The send-path tool-schema profile; defaults to the [`NonStrict`]
+    /// passthrough.
+    schema_profile: Arc<dyn SchemaProfile>,
     store: Option<Arc<dyn SessionStore<M>>>,
     _marker: std::marker::PhantomData<fn() -> M>,
 }
@@ -195,12 +204,15 @@ impl<M> Default for AgentBuilder<M> {
     fn default() -> Self {
         Self {
             provider: None,
+            #[cfg(any(feature = "anthropic", feature = "openai"))]
+            model: None,
             system: None,
             max_tool_iterations: DEFAULT_MAX_TOOL_ITERATIONS,
             idle_timeout: None,
             tools: Vec::new(),
             before_tool_call: None,
             after_tool_call: None,
+            schema_profile: Arc::new(NonStrict),
             store: None,
             _marker: std::marker::PhantomData,
         }
@@ -215,10 +227,44 @@ impl<M> AgentBuilder<M> {
     }
 
     /// Set the provider — the canonical seam. The model rides on the provider
-    /// instance, so it is chosen when the provider is constructed.
+    /// instance, so it is chosen when the provider is constructed. Mutually
+    /// exclusive with [`model`](Self::model), validated at [`build`](Self::build).
     #[must_use]
     pub fn provider<P: Provider + 'static>(mut self, provider: P) -> Self {
         self.provider = Some(Arc::new(provider));
+        self
+    }
+
+    /// Name a model by id and let the builder resolve the provider offline — the
+    /// convenience path over [`provider`](Self::provider), feature-gated by
+    /// `anthropic`/`openai`.
+    ///
+    /// Resolution runs synchronously at [`build`](Self::build): the compiled-in
+    /// catalog is loaded, the id resolved first-match-wins across enabled
+    /// providers, and the adapter built over a default reqwest client with
+    /// credentials from the provider's env var (e.g. `ANTHROPIC_API_KEY`). For an
+    /// explicit key or a custom HTTP client, construct the provider yourself and
+    /// pass it to [`provider`](Self::provider) instead.
+    ///
+    /// Mutually exclusive with [`provider`](Self::provider): setting both (or
+    /// neither) fails at `build` with [`Error::Build`]; an unknown id fails there
+    /// too, and a missing credential surfaces as [`Error::Provider`].
+    #[cfg(any(feature = "anthropic", feature = "openai"))]
+    #[must_use]
+    pub fn model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
+    /// Override the send-path tool-schema profile (default [`NonStrict`], a
+    /// passthrough). The profile normalizes each offered tool's argument schema
+    /// in place every turn before the provider call.
+    #[must_use]
+    pub fn schema_profile(
+        mut self,
+        profile: impl SchemaProfile + 'static,
+    ) -> Self {
+        self.schema_profile = Arc::new(profile);
         self
     }
 
@@ -322,13 +368,13 @@ impl<M> AgentBuilder<M> {
         self
     }
 
-    /// Validate the configuration and build the agent. Synchronous: the only
-    /// v1 check is that a provider was set. A missing provider is
-    /// [`Error::Build`].
+    /// Validate the configuration and build the agent. Synchronous: it resolves
+    /// exactly one of [`provider`](Self::provider) or [`model`](Self::model) —
+    /// both or neither is [`Error::Build`] — and, on the `model` path, builds the
+    /// provider offline from the compiled-in catalog (an unknown id is
+    /// `Error::Build`, a missing credential [`Error::Provider`]).
     pub fn build(self) -> Result<Agent<M>, Error> {
-        let provider = self
-            .provider
-            .ok_or_else(|| Error::Build("provider is required".to_string()))?;
+        let provider = self.resolve_provider()?;
         let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
         Ok(Agent {
             provider,
@@ -338,6 +384,7 @@ impl<M> AgentBuilder<M> {
             tools: Arc::new(self.tools),
             before_tool_call: self.before_tool_call,
             after_tool_call: self.after_tool_call,
+            schema_profile: self.schema_profile,
             transform: None,
             store: self.store,
             messages: Arc::new(Mutex::new(Vec::new())),
@@ -347,6 +394,49 @@ impl<M> AgentBuilder<M> {
             _marker: std::marker::PhantomData,
         })
     }
+
+    /// Resolve the configured provider seam. With a provider feature compiled in,
+    /// [`provider`](Self::provider) and [`model`](Self::model) are mutually
+    /// exclusive and exactly one is required; the `model` path resolves offline.
+    #[cfg(any(feature = "anthropic", feature = "openai"))]
+    fn resolve_provider(&self) -> Result<Arc<dyn Provider>, Error> {
+        match (&self.provider, &self.model) {
+            (Some(_), Some(_)) => Err(Error::Build(
+                "`.model` and `.provider` are mutually exclusive".to_string(),
+            )),
+            (None, None) => {
+                Err(Error::Build("a provider or model is required".to_string()))
+            }
+            (Some(provider), None) => Ok(provider.clone()),
+            (None, Some(model)) => resolve_model(model),
+        }
+    }
+
+    /// Resolve the configured provider seam. With no provider feature there is no
+    /// `model` path, so a provider is required.
+    #[cfg(not(any(feature = "anthropic", feature = "openai")))]
+    fn resolve_provider(&self) -> Result<Arc<dyn Provider>, Error> {
+        self.provider
+            .clone()
+            .ok_or_else(|| Error::Build("provider is required".to_string()))
+    }
+}
+
+/// Resolve a `.model("id")` offline into a live provider: load the compiled-in
+/// catalog with env-var credentials, find the entry first-match-wins across
+/// enabled providers, and build the adapter over a default reqwest client. An
+/// unknown id is [`Error::Build`]; a load or construction failure (e.g. a missing
+/// credential) is [`Error::Provider`].
+#[cfg(any(feature = "anthropic", feature = "openai"))]
+fn resolve_model(id: &str) -> Result<Arc<dyn Provider>, Error> {
+    use tapir_provider::http::ReqwestClient;
+    use tapir_provider::{ModelRegistry, create_provider};
+
+    let registry = ModelRegistry::load(None, None)?;
+    let entry = registry
+        .find_by_id(id)
+        .ok_or_else(|| Error::Build(format!("unknown model id `{id}`")))?;
+    Ok(create_provider(entry, ReqwestClient::new())?)
 }
 
 /// The stateful object owning the in-memory conversation history and driving
@@ -366,6 +456,9 @@ pub struct Agent<M = NoCustom> {
     /// The post-batch observe-only result hook, shared into every run; `None`
     /// is a no-op.
     after_tool_call: Option<AfterToolCall>,
+    /// The send-path tool-schema profile, shared into every run; normalizes each
+    /// offered tool's argument schema before the provider call.
+    schema_profile: Arc<dyn SchemaProfile>,
     /// The `transform_context` seam applied to history each turn before
     /// `convert_to_llm`. `None` is the identity (no reshaping); the builder
     /// that installs one lands in a later ticket.
@@ -474,6 +567,7 @@ impl<M: CustomMessage + Clone + Send + Sync + 'static> Agent<M> {
             tools: self.tools.clone(),
             before_tool_call: self.before_tool_call.clone(),
             after_tool_call: self.after_tool_call.clone(),
+            schema_profile: self.schema_profile.clone(),
             transform: self.transform.clone(),
             store: self.store.clone(),
             messages: self.messages.clone(),
@@ -567,6 +661,8 @@ struct RunLoop<M> {
     before_tool_call: Option<BeforeToolCall>,
     /// The post-batch observe-only result hook for this run; `None` is a no-op.
     after_tool_call: Option<AfterToolCall>,
+    /// The send-path tool-schema profile for this run.
+    schema_profile: Arc<dyn SchemaProfile>,
     transform: Option<Arc<TransformContext<M>>>,
     store: Option<Arc<dyn SessionStore<M>>>,
     messages: Arc<Mutex<Vec<AgentMessage<M>>>>,
@@ -599,6 +695,7 @@ async fn run_loop<M: CustomMessage + Clone + Send + Sync + 'static>(
         tools,
         before_tool_call,
         after_tool_call,
+        schema_profile,
         transform,
         store,
         messages,
@@ -660,7 +757,14 @@ async fn run_loop<M: CustomMessage + Clone + Send + Sync + 'static>(
                 ctx = ctx.with_system(system.clone());
             }
             if !tool_defs.is_empty() {
-                ctx = ctx.with_tools(tool_defs.clone());
+                // Normalize each offered tool's schema on the send path. The
+                // default `NonStrict` profile is a passthrough; a custom profile
+                // reshapes the portable schema for its provider here.
+                let mut defs = tool_defs.clone();
+                for def in &mut defs {
+                    schema_profile.normalize(&mut def.input_schema);
+                }
+                ctx = ctx.with_tools(defs);
             }
             ctx
         };

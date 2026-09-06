@@ -8,6 +8,7 @@
 pub use crate::agent::{Agent, Run, RunHandle, SteerMode};
 pub use crate::error::{Error, Result};
 pub use crate::event::AgentEvent;
+pub use crate::schema::{NonStrict, SchemaProfile};
 pub use crate::store::SessionStore;
 pub use crate::tool::{
     BoxFuture, Tool, ToolCall, ToolDecision, ToolError, ToolOutput,
