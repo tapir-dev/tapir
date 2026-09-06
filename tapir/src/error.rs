@@ -32,6 +32,15 @@ pub enum Error {
     /// The agent builder was misconfigured (validated synchronously at build).
     #[error("agent build error: {0}")]
     Build(String),
+
+    /// A user turn carried an image, but the bound model is known not to accept
+    /// image input. Raised by the multimodal entry points before anything is
+    /// sent, so the image is rejected outright rather than silently dropped or
+    /// left for the provider to refuse. Only the `.model("id")` path knows a
+    /// model's modalities; a hand-supplied `.provider(..)` leaves them unknown,
+    /// so this never fires there.
+    #[error("the bound model does not accept image input")]
+    ImageUnsupported,
 }
 
 /// The SDK result alias covering the sync/build paths.

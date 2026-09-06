@@ -8,6 +8,7 @@
 pub use crate::agent::{Agent, Run, RunHandle, SteerMode};
 pub use crate::error::{Error, Result};
 pub use crate::event::AgentEvent;
+pub use crate::message::UserInput;
 pub use crate::schema::{NonStrict, SchemaProfile};
 pub use crate::store::SessionStore;
 pub use crate::tool::{
@@ -17,6 +18,6 @@ pub use tapir_macros::tool;
 
 // Provider essentials, so the quick-start needs no second dependency.
 pub use tapir_provider::{
-    AssistantMessage, CompletionOptions, ContentPart, Context, Message,
-    Provider, ThinkingLevel,
+    AssistantMessage, CompletionOptions, ContentPart, Context, ImageSource,
+    MediaType, Message, Provider, ThinkingLevel,
 };

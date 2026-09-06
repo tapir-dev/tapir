@@ -27,4 +27,7 @@ token-store-file = ["tapir-provider/token-store-file"]
 store-file = ["dep:fs4"]
 
 [dev-dependencies]
+# `test-utils` unlocks the provider's `MockHttpClient` recording transport, which
+# the multimodal wire test drives a real `AnthropicProvider` over.
+tapir-provider = { workspace = true, features = ["test-utils"] }
 trybuild = "1.0"

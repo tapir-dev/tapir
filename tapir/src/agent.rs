@@ -38,7 +38,8 @@ use crate::cancel::{Cancel, cancel_pair};
 use crate::error::Error;
 use crate::event::AgentEvent;
 use crate::message::{
-    AgentMessage, CustomMessage, NoCustom, TransformContext, convert_to_llm,
+    AgentMessage, CustomMessage, NoCustom, TransformContext, UserInput,
+    convert_to_llm,
 };
 use crate::schema::{NonStrict, SchemaProfile};
 use crate::store::SessionStore;
@@ -68,14 +69,55 @@ pub enum SteerMode {
     Replace,
 }
 
+/// Whether the bound model accepts image input. Captured once at build: the
+/// `.model("id")` path reads it from the catalog's input modalities, while a
+/// hand-supplied provider leaves it [`Unknown`](Self::Unknown) since its
+/// modalities aren't known. The multimodal entry points reject an image turn
+/// only on [`No`](Self::No); `Yes` and [`Unknown`](Self::Unknown) admit it and
+/// leave any refusal to the provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageSupport {
+    /// The model accepts image input. Only the catalog-backed `.model("id")`
+    /// path learns this, so the variant exists only with a provider feature.
+    #[cfg(any(feature = "anthropic", feature = "openai"))]
+    Yes,
+    /// The model does not accept image input.
+    No,
+    /// Unknown — a provider was supplied directly, so its modalities aren't known.
+    Unknown,
+}
+
+impl ImageSupport {
+    /// From the catalog's per-model image-input flag captured on the `.model()`
+    /// path.
+    #[cfg(any(feature = "anthropic", feature = "openai"))]
+    fn from_catalog(accepts_image: bool) -> Self {
+        if accepts_image { Self::Yes } else { Self::No }
+    }
+
+    /// Admit `input`, unless it carries an image this model is known not to
+    /// accept — [`Error::ImageUnsupported`]. The one place the rule lives, shared
+    /// by the [`prompt_with`](Agent::prompt_with) /
+    /// [`converse_with`](Agent::converse_with) entry and the
+    /// [`steer_input`](RunHandle::steer_input) path.
+    fn admit(self, input: &UserInput) -> Result<(), Error> {
+        if self == Self::No && input.has_image() {
+            return Err(Error::ImageUnsupported);
+        }
+        Ok(())
+    }
+}
+
 /// One command on a run's ordered control channel. `Input` injects a user turn
 /// that the driver drains at the next `TurnEnd`; `Finish` requests a graceful
 /// stop.
 enum SteerCmd {
-    /// Inject `text` as a steered user turn, combined per `mode`.
+    /// Inject `parts` as a steered user turn, combined per `mode`. A text steer
+    /// carries a single text part; a multimodal steer carries mixed text/image
+    /// parts.
     Input {
-        /// The steer text.
-        text: String,
+        /// The steered user turn's content parts.
+        parts: Vec<ContentPart>,
         /// How it combines with any pending steer input.
         mode: SteerMode,
     },
@@ -87,14 +129,19 @@ enum SteerCmd {
 
 /// The cloneable control surface that outlives the [`Run`] the `.await` consumes.
 /// Obtained via [`Run::handle`] and shared to another task to abort or steer a
-/// live run. Every call is infallible and silent — a call after the run has
-/// terminated is a no-op.
+/// live run. The text and abort/finish calls are infallible and silent — a call
+/// after the run has terminated is a no-op; the multimodal
+/// [`steer_input`](Self::steer_input) is fallible only to reject an image bound
+/// for a non-multimodal model.
 #[derive(Clone)]
 pub struct RunHandle {
     /// Fires the run's cancellation token; cloned from the run.
     cancel: crate::cancel::CancelTrigger,
     /// The ordered control channel into the driver.
     steer: mpsc::UnboundedSender<SteerCmd>,
+    /// Whether the bound model accepts image input; cloned from the run so an
+    /// image steer can be rejected without a round trip.
+    image_support: ImageSupport,
 }
 
 impl RunHandle {
@@ -120,9 +167,49 @@ impl RunHandle {
     pub fn steer_with(&self, text: impl Into<String>, mode: SteerMode) {
         // A closed channel means the run already ended: drop silently.
         let _ = self.steer.send(SteerCmd::Input {
-            text: text.into(),
+            parts: vec![ContentPart::text(text)],
             mode,
         });
+    }
+
+    /// Steer the run with mixed text+image [`input`](UserInput), appended as one
+    /// user turn drained at the next [`TurnEnd`](AgentEvent::TurnEnd). Shorthand
+    /// for [`steer_input_with`](Self::steer_input_with) with
+    /// [`SteerMode::Append`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ImageUnsupported`] if `input` carries an image but the bound
+    /// model is known not to accept image input; the steer is rejected outright.
+    pub fn steer_input(
+        &self,
+        input: impl Into<UserInput>,
+    ) -> Result<(), Error> {
+        self.steer_input_with(input, SteerMode::Append)
+    }
+
+    /// Steer the run with mixed text+image [`input`](UserInput) under an explicit
+    /// [`SteerMode`]: `Append` adds another pending user turn, `Replace` discards
+    /// any pending steered input first. Applied at the next
+    /// [`TurnEnd`](AgentEvent::TurnEnd). A no-op once the run has terminated.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ImageUnsupported`] if `input` carries an image but the bound
+    /// model is known not to accept image input; the steer is rejected outright.
+    pub fn steer_input_with(
+        &self,
+        input: impl Into<UserInput>,
+        mode: SteerMode,
+    ) -> Result<(), Error> {
+        let input = input.into();
+        self.image_support.admit(&input)?;
+        // A closed channel means the run already ended: drop silently.
+        let _ = self.steer.send(SteerCmd::Input {
+            parts: input.into_parts(),
+            mode,
+        });
+        Ok(())
     }
 
     /// Finish the run gracefully. On a [`converse`](Agent::converse) run parked
@@ -389,10 +476,11 @@ impl<M> AgentBuilder<M> {
     /// provider offline from the compiled-in catalog (an unknown id is
     /// `Error::Build`, a missing credential [`Error::Provider`]).
     pub fn build(self) -> Result<Agent<M>, Error> {
-        let provider = self.resolve_provider()?;
+        let (provider, image_support) = self.resolve_provider()?;
         let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
         Ok(Agent {
             provider,
+            image_support,
             system: self.system,
             thinking: self.thinking,
             max_tool_iterations: self.max_tool_iterations,
@@ -411,11 +499,17 @@ impl<M> AgentBuilder<M> {
         })
     }
 
-    /// Resolve the configured provider seam. With a provider feature compiled in,
-    /// [`provider`](Self::provider) and [`model`](Self::model) are mutually
-    /// exclusive and exactly one is required; the `model` path resolves offline.
+    /// Resolve the configured provider seam and, alongside it, whether the bound
+    /// model accepts image input ([`ImageSupport::Yes`]/[`No`](ImageSupport::No)
+    /// only on the `model` path, which knows the catalog modalities;
+    /// [`Unknown`](ImageSupport::Unknown) for a hand-supplied provider). With a
+    /// provider feature compiled in, [`provider`](Self::provider) and
+    /// [`model`](Self::model) are mutually exclusive and exactly one is required;
+    /// the `model` path resolves offline.
     #[cfg(any(feature = "anthropic", feature = "openai"))]
-    fn resolve_provider(&self) -> Result<Arc<dyn Provider>, Error> {
+    fn resolve_provider(
+        &self,
+    ) -> Result<(Arc<dyn Provider>, ImageSupport), Error> {
         match (&self.provider, &self.model) {
             (Some(_), Some(_)) => Err(Error::Build(
                 "`.model` and `.provider` are mutually exclusive".to_string(),
@@ -423,42 +517,56 @@ impl<M> AgentBuilder<M> {
             (None, None) => {
                 Err(Error::Build("a provider or model is required".to_string()))
             }
-            (Some(provider), None) => Ok(provider.clone()),
+            (Some(provider), None) => {
+                Ok((provider.clone(), ImageSupport::Unknown))
+            }
             (None, Some(model)) => resolve_model(model),
         }
     }
 
     /// Resolve the configured provider seam. With no provider feature there is no
-    /// `model` path, so a provider is required.
+    /// `model` path, so a provider is required; its modalities are unknown, so
+    /// image support is left [`ImageSupport::Unknown`].
     #[cfg(not(any(feature = "anthropic", feature = "openai")))]
-    fn resolve_provider(&self) -> Result<Arc<dyn Provider>, Error> {
+    fn resolve_provider(
+        &self,
+    ) -> Result<(Arc<dyn Provider>, ImageSupport), Error> {
         self.provider
             .clone()
+            .map(|provider| (provider, ImageSupport::Unknown))
             .ok_or_else(|| Error::Build("provider is required".to_string()))
     }
 }
 
-/// Resolve a `.model("id")` offline into a live provider: load the compiled-in
-/// catalog with env-var credentials, find the entry first-match-wins across
-/// enabled providers, and build the adapter over a default reqwest client. An
-/// unknown id is [`Error::Build`]; a load or construction failure (e.g. a missing
-/// credential) is [`Error::Provider`].
+/// Resolve a `.model("id")` offline into a live provider plus whether it accepts
+/// image input: load the compiled-in catalog with env-var credentials, find the
+/// entry first-match-wins across enabled providers, read its input modalities,
+/// and build the adapter over a default reqwest client. An unknown id is
+/// [`Error::Build`]; a load or construction failure (e.g. a missing credential)
+/// is [`Error::Provider`].
 #[cfg(any(feature = "anthropic", feature = "openai"))]
-fn resolve_model(id: &str) -> Result<Arc<dyn Provider>, Error> {
+fn resolve_model(id: &str) -> Result<(Arc<dyn Provider>, ImageSupport), Error> {
     use tapir_provider::http::ReqwestClient;
+    use tapir_provider::model::InputType;
     use tapir_provider::{ModelRegistry, create_provider};
 
     let registry = ModelRegistry::load(None, None)?;
     let entry = registry
         .find_by_id(id)
         .ok_or_else(|| Error::Build(format!("unknown model id `{id}`")))?;
-    Ok(create_provider(entry, ReqwestClient::new())?)
+    let accepts_image = entry.model.input.contains(&InputType::Image);
+    let provider = create_provider(entry, ReqwestClient::new())?;
+    Ok((provider, ImageSupport::from_catalog(accepts_image)))
 }
 
 /// The stateful object owning the in-memory conversation history and driving
 /// runs. Generic over a custom-message type `M`, defaulting to [`NoCustom`].
 pub struct Agent<M = NoCustom> {
     provider: Arc<dyn Provider>,
+    /// Whether the bound model accepts image input, captured at build. The
+    /// multimodal entry points reject an image turn only on
+    /// [`ImageSupport::No`].
+    image_support: ImageSupport,
     system: Option<String>,
     /// The reasoning-effort level applied to every run's turns; `None` leaves
     /// the provider default.
@@ -556,6 +664,53 @@ impl<M: CustomMessage + Clone + Send + Sync + 'static> Agent<M> {
         self.run(true)
     }
 
+    /// Like [`prompt`](Self::prompt), but the user turn is mixed text+image
+    /// [`input`](UserInput) rather than a bare string — a screenshot handed to
+    /// the agent alongside a question, say.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ImageUnsupported`] if `input` carries an image but the bound
+    /// model is known not to accept image input; the turn is rejected before the
+    /// run starts, so the image is never silently dropped.
+    pub fn prompt_with(
+        &self,
+        input: impl Into<UserInput>,
+    ) -> Result<Run, Error> {
+        Ok(self.enter_with(input)?.run(false))
+    }
+
+    /// Like [`converse`](Self::converse), but the user turn is mixed text+image
+    /// [`input`](UserInput) rather than a bare string. Subsequent turns can be
+    /// steered with more mixed content via [`steer_input`](RunHandle::steer_input).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ImageUnsupported`] if `input` carries an image but the bound
+    /// model is known not to accept image input; the turn is rejected before the
+    /// run starts, so the image is never silently dropped.
+    pub fn converse_with(
+        &self,
+        input: impl Into<UserInput>,
+    ) -> Result<Run, Error> {
+        Ok(self.enter_with(input)?.run(true))
+    }
+
+    /// Guard mixed content against the bound model's modalities, then append it
+    /// as one user turn. Shared by [`prompt_with`](Self::prompt_with) and
+    /// [`converse_with`](Self::converse_with); returns `&self` so the caller
+    /// picks the run shape. An image bound for a known non-multimodal model is
+    /// [`Error::ImageUnsupported`]; nothing is appended in that case.
+    fn enter_with(&self, input: impl Into<UserInput>) -> Result<&Self, Error> {
+        let input = input.into();
+        self.image_support.admit(&input)?;
+        self.messages
+            .lock()
+            .expect("history mutex poisoned")
+            .push(AgentMessage::Llm(Message::user_parts(input.into_parts())));
+        Ok(self)
+    }
+
     /// Subscribe to this session's events across all runs. Each run's events are
     /// tagged with a [`RunId`] so concurrent runs are distinguishable.
     #[must_use]
@@ -601,6 +756,7 @@ impl<M: CustomMessage + Clone + Send + Sync + 'static> Agent<M> {
             rx,
             cancel: cancel_trigger,
             steer: steer_tx,
+            image_support: self.image_support,
         }
     }
 }
@@ -614,6 +770,9 @@ pub struct Run {
     cancel: crate::cancel::CancelTrigger,
     /// The sending half of the run's ordered control channel.
     steer: mpsc::UnboundedSender<SteerCmd>,
+    /// Whether the bound model accepts image input; cloned onto each
+    /// [`RunHandle`] so an image steer can be rejected without a round trip.
+    image_support: ImageSupport,
 }
 
 impl Run {
@@ -625,6 +784,7 @@ impl Run {
         RunHandle {
             cancel: self.cancel.clone(),
             steer: self.steer.clone(),
+            image_support: self.image_support,
         }
     }
 }
@@ -1010,19 +1170,19 @@ async fn persist_tail<M: CustomMessage + Clone + Send + Sync + 'static>(
 /// into the user turns to inject, in order, reporting whether a
 /// [`Finish`](SteerCmd::Finish) was among them. The channel is ordered, so
 /// folding in receive order honors the caller's sequence:
-/// [`Append`](SteerMode::Append) adds its text as one more pending turn, while
+/// [`Append`](SteerMode::Append) adds its parts as one more pending turn, while
 /// [`Replace`](SteerMode::Replace) discards whatever is pending and starts over
-/// from its text. Purely non-blocking — it takes only what is already queued and
+/// from its parts. Purely non-blocking — it takes only what is already queued and
 /// never awaits.
 fn drain_steer(
     steer: &mut mpsc::UnboundedReceiver<SteerCmd>,
-) -> (Vec<String>, bool) {
-    let mut pending: Vec<String> = Vec::new();
+) -> (Vec<Vec<ContentPart>>, bool) {
+    let mut pending: Vec<Vec<ContentPart>> = Vec::new();
     let mut finish = false;
     while let Ok(cmd) = steer.try_recv() {
         match cmd {
-            SteerCmd::Input { text, mode } => {
-                fold_steer_input(&mut pending, text, mode);
+            SteerCmd::Input { parts, mode } => {
+                fold_steer_input(&mut pending, parts, mode);
             }
             SteerCmd::Finish => finish = true,
         }
@@ -1033,31 +1193,35 @@ fn drain_steer(
 /// Fold one steered input into the pending user turns per its [`SteerMode`]:
 /// [`Append`](SteerMode::Append) adds another turn,
 /// [`Replace`](SteerMode::Replace) discards the pending turns and starts over
-/// from this text. Shared by the `TurnEnd` drain and the idle-park wake so both
+/// from these parts. Shared by the `TurnEnd` drain and the idle-park wake so both
 /// honor the same `Append`/`Replace` semantics.
-fn fold_steer_input(pending: &mut Vec<String>, text: String, mode: SteerMode) {
+fn fold_steer_input(
+    pending: &mut Vec<Vec<ContentPart>>,
+    parts: Vec<ContentPart>,
+    mode: SteerMode,
+) {
     match mode {
-        SteerMode::Append => pending.push(text),
+        SteerMode::Append => pending.push(parts),
         SteerMode::Replace => {
             pending.clear();
-            pending.push(text);
+            pending.push(parts);
         }
     }
 }
 
-/// Push each steered text into history as its own user turn, under one lock; a
+/// Push each steered turn into history as its own user message, under one lock; a
 /// no-op on an empty batch. Shared by the `TurnEnd` drain and the idle-park wake,
 /// which inject folded steer input the same way.
 fn inject_user_turns<M>(
     messages: &Arc<Mutex<Vec<AgentMessage<M>>>>,
-    turns: Vec<String>,
+    turns: Vec<Vec<ContentPart>>,
 ) {
     if turns.is_empty() {
         return;
     }
     let mut guard = messages.lock().expect("history mutex poisoned");
-    for text in turns {
-        guard.push(AgentMessage::Llm(Message::user(text)));
+    for parts in turns {
+        guard.push(AgentMessage::Llm(Message::user_parts(parts)));
     }
 }
 
@@ -1065,7 +1229,7 @@ fn inject_user_turns<M>(
 enum Park {
     /// A steer arrived: inject these folded user turns and resume with a fresh
     /// tool-iteration cap.
-    Steered(Vec<String>),
+    Steered(Vec<Vec<ContentPart>>),
     /// [`finish`](RunHandle::finish) was requested, or every control sender
     /// dropped: end the run with [`AgentEnd`](AgentEvent::AgentEnd).
     Finished,
@@ -1117,12 +1281,12 @@ async fn park(
     while let Ok(cmd) = steer.try_recv() {
         cmds.push(cmd);
     }
-    let mut steered: Vec<String> = Vec::new();
+    let mut steered: Vec<Vec<ContentPart>> = Vec::new();
     for cmd in cmds {
         match cmd {
             SteerCmd::Finish => return Park::Finished,
-            SteerCmd::Input { text, mode } => {
-                fold_steer_input(&mut steered, text, mode);
+            SteerCmd::Input { parts, mode } => {
+                fold_steer_input(&mut steered, parts, mode);
             }
         }
     }
