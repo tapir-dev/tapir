@@ -8,8 +8,10 @@
 //! runs a tool-requesting turn's batch through the concurrency-classed scheduler
 //! (`execute_batch`): consecutive `Safe` calls run concurrently while each
 //! `Exclusive` call serializes behind a barrier, and results are assembled back
-//! in model order before feeding history. Steering lands in a later ticket; the
-//! cancellation seam is scaffolded here for the abort ticket to drive.
+//! in model order before feeding history. A [`RunHandle`] cloned off the run
+//! controls it from another task: `abort` fires the run's cancellation token
+//! (honored at turn-top and the batch checkpoints), and `steer` injects a user
+//! turn drained at the next `TurnEnd`.
 
 use std::future::{Future, IntoFuture};
 use std::pin::Pin;
@@ -48,16 +50,72 @@ pub struct RunId(pub u64);
 
 /// How a steer injection combines with the pending user input.
 #[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SteerMode {
-    /// Append the steer text as a new user turn.
+    /// Append the steer text to the pending user input, as its own turn.
     Append,
     /// Replace the pending user input with the steer text.
     Replace,
 }
 
-/// The cloneable control surface (abort / steer / finish) that outlives the
-/// [`Run`]. Its methods land with the cancellation and steering tickets.
-pub struct RunHandle;
+/// One command on a run's ordered control channel. `Input` injects a user turn
+/// that the driver drains at the next `TurnEnd`; `Finish` requests a graceful
+/// stop.
+enum SteerCmd {
+    /// Inject `text` as a steered user turn, combined per `mode`.
+    Input {
+        /// The steer text.
+        text: String,
+        /// How it combines with any pending steer input.
+        mode: SteerMode,
+    },
+    /// Request the run finish gracefully after the current turn.
+    #[allow(
+        dead_code,
+        reason = "graceful finish is driven by the follow-up ticket"
+    )]
+    Finish,
+}
+
+/// The cloneable control surface that outlives the [`Run`] the `.await` consumes.
+/// Obtained via [`Run::handle`] and shared to another task to abort or steer a
+/// live run. Every call is infallible and silent — a call after the run has
+/// terminated is a no-op.
+#[derive(Clone)]
+pub struct RunHandle {
+    /// Fires the run's cancellation token; cloned from the run.
+    cancel: crate::cancel::CancelTrigger,
+    /// The ordered control channel into the driver.
+    steer: mpsc::UnboundedSender<SteerCmd>,
+}
+
+impl RunHandle {
+    /// Abort the run cooperatively. Honored at the next turn-top or tool-batch
+    /// checkpoint, where it cascade-cancels any in-flight batch and terminates
+    /// the run with [`Error::Cancelled`]. Idempotent, and a no-op once the run
+    /// has already terminated.
+    pub fn abort(&self) {
+        self.cancel.cancel();
+    }
+
+    /// Steer the run by appending `text` as a user turn, drained at the next
+    /// [`TurnEnd`](AgentEvent::TurnEnd). Shorthand for
+    /// [`steer_with`](Self::steer_with) with [`SteerMode::Append`].
+    pub fn steer(&self, text: impl Into<String>) {
+        self.steer_with(text, SteerMode::Append);
+    }
+
+    /// Steer the run with an explicit [`SteerMode`]: `Append` adds `text` to the
+    /// pending user input, `Replace` overwrites it. Applied at the next
+    /// [`TurnEnd`](AgentEvent::TurnEnd). A no-op once the run has terminated.
+    pub fn steer_with(&self, text: impl Into<String>, mode: SteerMode) {
+        // A closed channel means the run already ended: drop silently.
+        let _ = self.steer.send(SteerCmd::Input {
+            text: text.into(),
+            mode,
+        });
+    }
+}
 
 /// The loop state the pure kernel folds over: how many tool-requesting turns
 /// have run, and the configured cap.
@@ -289,6 +347,12 @@ impl<M: CustomMessage + Clone + Send + Sync + 'static> Agent<M> {
     fn run(&self) -> Run {
         let run = RunId(self.next_run.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = mpsc::unbounded_channel();
+        // The control surface: one cancellation token and one ordered steer
+        // channel. The trigger and steer sender ride on the `Run` so
+        // `Run::handle` can clone them onto a `RunHandle` that outlives it; the
+        // observer half and the steer receiver move onto the driver task.
+        let (cancel_trigger, cancel) = cancel_pair();
+        let (steer_tx, steer_rx) = mpsc::unbounded_channel();
         tokio::spawn(run_loop(RunLoop {
             run,
             provider: self.provider.clone(),
@@ -301,8 +365,14 @@ impl<M: CustomMessage + Clone + Send + Sync + 'static> Agent<M> {
             persisted: self.persisted.clone(),
             tx,
             bcast: self.events.clone(),
+            cancel,
+            steer: steer_rx,
         }));
-        Run { rx }
+        Run {
+            rx,
+            cancel: cancel_trigger,
+            steer: steer_tx,
+        }
     }
 }
 
@@ -311,6 +381,23 @@ impl<M: CustomMessage + Clone + Send + Sync + 'static> Agent<M> {
 /// the settled reply.
 pub struct Run {
     rx: mpsc::UnboundedReceiver<AgentEvent>,
+    /// The run's cancellation trigger, cloned onto each [`RunHandle`].
+    cancel: crate::cancel::CancelTrigger,
+    /// The sending half of the run's ordered control channel.
+    steer: mpsc::UnboundedSender<SteerCmd>,
+}
+
+impl Run {
+    /// Take a [`RunHandle`] onto this run: a cloneable control surface that
+    /// outlives the `Run` the `.await` consumes, so another task can abort or
+    /// steer the run after this value is gone.
+    #[must_use]
+    pub fn handle(&self) -> RunHandle {
+        RunHandle {
+            cancel: self.cancel.clone(),
+            steer: self.steer.clone(),
+        }
+    }
 }
 
 impl Stream for Run {
@@ -361,6 +448,12 @@ struct RunLoop<M> {
     persisted: Arc<Mutex<usize>>,
     tx: mpsc::UnboundedSender<AgentEvent>,
     bcast: broadcast::Sender<AgentEvent>,
+    /// The observer half of the run's cancellation token, watched at turn-top and
+    /// threaded into each tool batch for the cascade.
+    cancel: Cancel,
+    /// The receiving half of the run's ordered control channel, drained at each
+    /// `TurnEnd`.
+    steer: mpsc::UnboundedReceiver<SteerCmd>,
 }
 
 /// The async driver for one run. Owns the IO and event fan-out; defers every
@@ -383,6 +476,8 @@ async fn run_loop<M: CustomMessage + Clone + Send + Sync + 'static>(
         persisted,
         tx,
         bcast,
+        cancel,
+        mut steer,
     } = driver;
     // The provider-ready definitions offered every turn; derived once since the
     // tool set is fixed for the run.
@@ -394,11 +489,9 @@ async fn run_loop<M: CustomMessage + Clone + Send + Sync + 'static>(
     let emitter = Emitter { tx, bcast };
     let emit = |ev: AgentEvent| emitter.emit(ev);
 
-    // One cancellation token spans the run. Held here for the run's lifetime so
-    // it outlives every batch; the abort ticket wires the trigger onto the
-    // `RunHandle`. Until then the trigger never fires, so the run is effectively
-    // un-cancellable and `execute_batch` always completes.
-    let (_cancel_trigger, cancel) = cancel_pair();
+    // One cancellation token spans the run, cloned into each tool batch for the
+    // cascade. Its trigger rides on the `RunHandle`; `abort` fires it, honored at
+    // the turn-top check below and at the batch checkpoints in `execute_batch`.
 
     emit(AgentEvent::AgentStart { run });
 
@@ -409,6 +502,12 @@ async fn run_loop<M: CustomMessage + Clone + Send + Sync + 'static>(
     let mut turn = 0usize;
 
     let outcome: Result<AssistantMessage, Error> = loop {
+        // Turn-top abort checkpoint: an abort fired between turns terminates the
+        // run here, before any provider work, with `Error::Cancelled`.
+        if cancel.is_cancelled() {
+            break Err(Error::Cancelled);
+        }
+
         emit(AgentEvent::TurnStart { turn });
 
         // Write-through the pending tail before the provider call — on the first
@@ -518,12 +617,9 @@ async fn run_loop<M: CustomMessage + Clone + Send + Sync + 'static>(
                 }
             }
             BatchOutcome::Cancelled => {
-                // The abort ticket owns terminal handling; until it lands the
-                // trigger never fires, so this arm is unreachable in a live run.
-                break Err(Error::Provider(tapir_provider::Error::new(
-                    tapir_provider::ErrorKind::Other,
-                    "run cancelled",
-                )));
+                // An abort fired mid-batch: the cascade already aborted in-flight
+                // calls and launched no more, so terminate the run here.
+                break Err(Error::Cancelled);
             }
         }
 
@@ -531,6 +627,16 @@ async fn run_loop<M: CustomMessage + Clone + Send + Sync + 'static>(
         // the next turn re-prompts on them. Fail closed on a store error.
         if let Err(error) = persist_tail(&store, &messages, &persisted).await {
             break Err(error);
+        }
+
+        // TurnEnd steer drain: fold every queued control command, then inject any
+        // steered user turn into history so the next turn's provider call picks it
+        // up at the turn boundary.
+        if let Some(text) = drain_steer(&mut steer) {
+            messages
+                .lock()
+                .expect("history mutex poisoned")
+                .push(AgentMessage::Llm(Message::user(text)));
         }
 
         emit(AgentEvent::TurnEnd { turn });
@@ -578,6 +684,34 @@ async fn persist_tail<M: CustomMessage + Clone + Send + Sync + 'static>(
             }
         }
     }
+}
+
+/// Drain every command queued on the control channel and fold the steer inputs
+/// into the one user turn to inject, or `None` when nothing was steered. The
+/// channel is ordered, so folding in receive order honors the caller's sequence:
+/// [`Append`](SteerMode::Append) concatenates onto the pending text as its own
+/// line, and [`Replace`](SteerMode::Replace) discards whatever was pending. Purely
+/// non-blocking — it takes only what is already queued and never awaits.
+fn drain_steer(
+    steer: &mut mpsc::UnboundedReceiver<SteerCmd>,
+) -> Option<String> {
+    let mut pending: Option<String> = None;
+    while let Ok(cmd) = steer.try_recv() {
+        match cmd {
+            SteerCmd::Input { text, mode } => match mode {
+                SteerMode::Append => {
+                    pending = Some(match pending {
+                        Some(prior) => format!("{prior}\n{text}"),
+                        None => text,
+                    });
+                }
+                SteerMode::Replace => pending = Some(text),
+            },
+            // Graceful finish is driven by the follow-up ticket; nothing to fold.
+            SteerCmd::Finish => {}
+        }
+    }
+    pending
 }
 
 /// One model-requested call, lifted out of the reply into owned fields so the

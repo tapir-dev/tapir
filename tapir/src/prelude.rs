@@ -5,7 +5,7 @@
 //! `SchemaProfile`) live here rather than at the crate root to avoid
 //! method-resolution surprises.
 
-pub use crate::agent::{Agent, Run, RunHandle};
+pub use crate::agent::{Agent, Run, RunHandle, SteerMode};
 pub use crate::error::{Error, Result};
 pub use crate::event::AgentEvent;
 pub use crate::store::SessionStore;

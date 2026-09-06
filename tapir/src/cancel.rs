@@ -3,9 +3,9 @@
 
 //! Batch-scoped cooperative cancellation.
 //!
-//! A run mints one [`CancelTrigger`]/[`Cancel`] pair. The trigger is held by the
-//! driver (the abort ticket wires it onto the [`RunHandle`](crate::agent::RunHandle));
-//! the observer half is cloned into the batch executor and into every
+//! A run mints one [`CancelTrigger`]/[`Cancel`] pair. The trigger is cloned onto
+//! every [`RunHandle`](crate::agent::RunHandle) so any holder can fire abort; the
+//! observer half is cloned into the batch executor and into every
 //! [`ToolCtx`](crate::tool::ToolCtx). Firing the trigger fans out to all clones at
 //! once, so the executor stops launching queued calls and a long-running tool that
 //! selects on [`Cancel::cancelled`] can bail — the cascade that leaves no orphaned
@@ -16,6 +16,7 @@
 //! `ctx` is still dropped at its next await point.
 
 use std::future;
+use std::sync::Arc;
 
 use tokio::sync::watch;
 
@@ -26,25 +27,21 @@ pub(crate) struct Cancel {
     rx: watch::Receiver<bool>,
 }
 
-/// The trigger half, held by the run's driver. Dropping it without firing leaves
-/// the paired [`Cancel`] permanently un-cancelled.
-///
-/// Scaffolding: the run holds one but never fires it yet — the abort ticket wires
-/// [`cancel`](Self::cancel) onto [`RunHandle`](crate::agent::RunHandle). Exercised
-/// by the executor's cancellation tests meanwhile.
-#[derive(Debug)]
-#[allow(dead_code, reason = "trigger fired by the abort ticket; tested here")]
+/// The trigger half, cloned onto every [`RunHandle`](crate::agent::RunHandle) so
+/// any holder can fire abort. One `watch::Sender` is shared behind an `Arc`, so
+/// the pair stays live as long as a trigger clone exists; when the last one drops
+/// without firing, the paired [`Cancel`] can never fire and parks forever.
+#[derive(Debug, Clone)]
 pub(crate) struct CancelTrigger {
-    tx: watch::Sender<bool>,
+    tx: Arc<watch::Sender<bool>>,
 }
 
 /// Mint a fresh trigger/observer pair, initially un-cancelled.
 pub(crate) fn cancel_pair() -> (CancelTrigger, Cancel) {
     let (tx, rx) = watch::channel(false);
-    (CancelTrigger { tx }, Cancel { rx })
+    (CancelTrigger { tx: Arc::new(tx) }, Cancel { rx })
 }
 
-#[allow(dead_code, reason = "trigger fired by the abort ticket; tested here")]
 impl CancelTrigger {
     /// Fire cancellation. Idempotent; every live [`Cancel`] clone observes it.
     pub(crate) fn cancel(&self) {
