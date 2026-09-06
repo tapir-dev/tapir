@@ -29,7 +29,8 @@ use futures_core::Stream;
 use futures_util::StreamExt;
 use tapir_provider::{
     AssistantMessage, CompletionOptions, ContentPart, Context, Message,
-    Provider, StreamAccumulator, ToolDefinition, ToolResultMessage,
+    Provider, StreamAccumulator, ThinkingLevel, ToolDefinition,
+    ToolResultMessage,
 };
 use tokio::sync::{broadcast, mpsc};
 
@@ -188,6 +189,9 @@ pub struct AgentBuilder<M = NoCustom> {
     #[cfg(any(feature = "anthropic", feature = "openai"))]
     model: Option<String>,
     system: Option<String>,
+    /// The reasoning-effort level applied to every turn's completion; `None`
+    /// leaves the provider default (no thinking budget).
+    thinking: Option<ThinkingLevel>,
     max_tool_iterations: usize,
     idle_timeout: Option<Duration>,
     tools: Vec<Arc<dyn ErasedTool>>,
@@ -207,6 +211,7 @@ impl<M> Default for AgentBuilder<M> {
             #[cfg(any(feature = "anthropic", feature = "openai"))]
             model: None,
             system: None,
+            thinking: None,
             max_tool_iterations: DEFAULT_MAX_TOOL_ITERATIONS,
             idle_timeout: None,
             tools: Vec::new(),
@@ -272,6 +277,16 @@ impl<M> AgentBuilder<M> {
     #[must_use]
     pub fn system(mut self, system: impl Into<String>) -> Self {
         self.system = Some(system.into());
+        self
+    }
+
+    /// Set the reasoning-effort level applied to every turn's completion. Unset
+    /// (the default) leaves the provider default, i.e. no thinking budget. The
+    /// level rides on each turn's [`CompletionOptions`] via
+    /// [`with_thinking`](tapir_provider::CompletionOptions::with_thinking).
+    #[must_use]
+    pub fn thinking(mut self, level: ThinkingLevel) -> Self {
+        self.thinking = Some(level);
         self
     }
 
@@ -379,6 +394,7 @@ impl<M> AgentBuilder<M> {
         Ok(Agent {
             provider,
             system: self.system,
+            thinking: self.thinking,
             max_tool_iterations: self.max_tool_iterations,
             idle_timeout: self.idle_timeout,
             tools: Arc::new(self.tools),
@@ -444,6 +460,9 @@ fn resolve_model(id: &str) -> Result<Arc<dyn Provider>, Error> {
 pub struct Agent<M = NoCustom> {
     provider: Arc<dyn Provider>,
     system: Option<String>,
+    /// The reasoning-effort level applied to every run's turns; `None` leaves
+    /// the provider default.
+    thinking: Option<ThinkingLevel>,
     max_tool_iterations: usize,
     /// How long a `converse` run parks in the idle state before ending itself;
     /// `None` parks indefinitely. Ignored by `prompt`/`resume` runs.
@@ -561,6 +580,7 @@ impl<M: CustomMessage + Clone + Send + Sync + 'static> Agent<M> {
             run,
             provider: self.provider.clone(),
             system: self.system.clone(),
+            thinking: self.thinking,
             max_tool_iterations: self.max_tool_iterations,
             idle_timeout: self.idle_timeout,
             follow_up,
@@ -649,6 +669,9 @@ struct RunLoop<M> {
     run: RunId,
     provider: Arc<dyn Provider>,
     system: Option<String>,
+    /// The reasoning-effort level applied to every turn's completion; `None`
+    /// leaves the provider default.
+    thinking: Option<ThinkingLevel>,
     max_tool_iterations: usize,
     /// How long to park in the idle state before ending a follow-up run; `None`
     /// parks indefinitely. Only consulted when `follow_up` is set.
@@ -689,6 +712,7 @@ async fn run_loop<M: CustomMessage + Clone + Send + Sync + 'static>(
         run,
         provider,
         system,
+        thinking,
         max_tool_iterations,
         idle_timeout,
         follow_up,
@@ -768,7 +792,10 @@ async fn run_loop<M: CustomMessage + Clone + Send + Sync + 'static>(
             }
             ctx
         };
-        let opts = CompletionOptions::default();
+        let opts = match thinking {
+            Some(level) => CompletionOptions::default().with_thinking(level),
+            None => CompletionOptions::default(),
+        };
 
         emit(AgentEvent::MessageStart { turn });
         let mut acc = StreamAccumulator::new();
