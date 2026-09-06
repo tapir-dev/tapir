@@ -130,14 +130,25 @@ fn tool_call_script(id: &str, name: &str) -> Vec<StreamEvent> {
     ]
 }
 
+/// The empty argument object shared by the test tools.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct NoArgs {}
 
+/// Spin until `flag` is set, so a test only acts once the tool is genuinely in
+/// flight. A short poll keeps the wait cheap; the callers wrap it in a timeout.
+async fn wait_set(flag: &AtomicBool) {
+    while !flag.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
 /// A `Safe` tool that flags when it starts, then parks forever — so the only way
 /// it ever stops is the batch executor aborting its task on the cascade.
 struct Blocker {
+    /// Set once the tool body is entered.
     started: Arc<AtomicBool>,
+    /// Set only if the body runs to completion — proof it was *not* aborted.
     finished: Arc<AtomicBool>,
 }
 
@@ -175,7 +186,9 @@ impl tapir::tool::Tool for Blocker {
 /// it. The gate lets a test enqueue a steer while the batch is genuinely in
 /// flight, so the injection is deterministic rather than racing the turn.
 struct Gate {
+    /// Set once the tool body is entered.
     started: Arc<AtomicBool>,
+    /// The test sets this to let the body return and the turn finish.
     release: Arc<AtomicBool>,
 }
 
@@ -231,9 +244,7 @@ async fn abort_cancels_the_run_and_cascades_the_batch() {
     let task = tokio::spawn(async move { run.await });
 
     // Abort only once the blocker is genuinely in flight.
-    while !started.load(Ordering::SeqCst) {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
+    wait_set(&started).await;
     handle.abort();
     // Idempotent: a second abort is harmless.
     handle.abort();
@@ -280,9 +291,7 @@ async fn steer_appends_a_user_turn_picked_up_next_turn() {
     let handle = run.handle();
     let task = tokio::spawn(async move { run.await });
 
-    while !started.load(Ordering::SeqCst) {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
+    wait_set(&started).await;
     // Enqueue the steer while the batch is in flight, then let the turn finish.
     handle.steer("injected");
     release.store(true, Ordering::SeqCst);
@@ -326,9 +335,7 @@ async fn steer_with_replace_overrides_pending_input() {
     let handle = run.handle();
     let task = tokio::spawn(async move { run.await });
 
-    while !started.load(Ordering::SeqCst) {
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
+    wait_set(&started).await;
     // Append then Replace before the turn boundary: Replace discards the pending
     // append, so only the replacement lands.
     handle.steer("first");
@@ -348,5 +355,49 @@ async fn steer_with_replace_overrides_pending_input() {
         seen[1],
         ["go", "second"],
         "Replace must override the pending appended input"
+    );
+}
+
+#[tokio::test]
+async fn multiple_appends_each_land_as_their_own_turn() {
+    let started = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(AtomicBool::new(false));
+    let provider = ScriptedProvider::new(vec![
+        tool_call_script("g", "gate"),
+        text_script("done"),
+    ]);
+    let user_texts = provider.user_texts();
+    let agent = Agent::builder()
+        .provider(provider)
+        .tool(Gate {
+            started: started.clone(),
+            release: release.clone(),
+        })
+        .build()
+        .expect("build");
+
+    let run = agent.prompt("go");
+    let handle = run.handle();
+    let task = tokio::spawn(async move { run.await });
+
+    wait_set(&started).await;
+    // Two appends queued before the same turn boundary each become their own
+    // user turn, in order.
+    handle.steer("one");
+    handle.steer("two");
+    release.store(true, Ordering::SeqCst);
+
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("run must complete")
+        .expect("run task")
+        .expect("run");
+
+    let seen = user_texts.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(
+        seen[1],
+        ["go", "one", "two"],
+        "each Append must land as its own user turn, in order"
     );
 }

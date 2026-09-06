@@ -48,13 +48,13 @@ const BROADCAST_CAPACITY: usize = 256;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RunId(pub u64);
 
-/// How a steer injection combines with the pending user input.
+/// How a steer injection combines with input already steered but not yet drained.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SteerMode {
-    /// Append the steer text to the pending user input, as its own turn.
+    /// Add the steer text as one more pending user turn.
     Append,
-    /// Replace the pending user input with the steer text.
+    /// Discard any pending steered input and start over from the steer text.
     Replace,
 }
 
@@ -105,9 +105,10 @@ impl RunHandle {
         self.steer_with(text, SteerMode::Append);
     }
 
-    /// Steer the run with an explicit [`SteerMode`]: `Append` adds `text` to the
-    /// pending user input, `Replace` overwrites it. Applied at the next
-    /// [`TurnEnd`](AgentEvent::TurnEnd). A no-op once the run has terminated.
+    /// Steer the run with an explicit [`SteerMode`]: `Append` adds `text` as
+    /// another pending user turn, `Replace` discards any pending steered input
+    /// first. Applied at the next [`TurnEnd`](AgentEvent::TurnEnd). A no-op once
+    /// the run has terminated.
     pub fn steer_with(&self, text: impl Into<String>, mode: SteerMode) {
         // A closed channel means the run already ended: drop silently.
         let _ = self.steer.send(SteerCmd::Input {
@@ -489,10 +490,6 @@ async fn run_loop<M: CustomMessage + Clone + Send + Sync + 'static>(
     let emitter = Emitter { tx, bcast };
     let emit = |ev: AgentEvent| emitter.emit(ev);
 
-    // One cancellation token spans the run, cloned into each tool batch for the
-    // cascade. Its trigger rides on the `RunHandle`; `abort` fires it, honored at
-    // the turn-top check below and at the batch checkpoints in `execute_batch`.
-
     emit(AgentEvent::AgentStart { run });
 
     let mut state = LoopState {
@@ -629,14 +626,15 @@ async fn run_loop<M: CustomMessage + Clone + Send + Sync + 'static>(
             break Err(error);
         }
 
-        // TurnEnd steer drain: fold every queued control command, then inject any
-        // steered user turn into history so the next turn's provider call picks it
-        // up at the turn boundary.
-        if let Some(text) = drain_steer(&mut steer) {
-            messages
-                .lock()
-                .expect("history mutex poisoned")
-                .push(AgentMessage::Llm(Message::user(text)));
+        // TurnEnd steer drain: fold every queued control command, then inject each
+        // steered user turn into history so the next turn's provider call picks
+        // them up at the turn boundary.
+        let steered = drain_steer(&mut steer);
+        if !steered.is_empty() {
+            let mut guard = messages.lock().expect("history mutex poisoned");
+            for text in steered {
+                guard.push(AgentMessage::Llm(Message::user(text)));
+            }
         }
 
         emit(AgentEvent::TurnEnd { turn });
@@ -687,25 +685,21 @@ async fn persist_tail<M: CustomMessage + Clone + Send + Sync + 'static>(
 }
 
 /// Drain every command queued on the control channel and fold the steer inputs
-/// into the one user turn to inject, or `None` when nothing was steered. The
-/// channel is ordered, so folding in receive order honors the caller's sequence:
-/// [`Append`](SteerMode::Append) concatenates onto the pending text as its own
-/// line, and [`Replace`](SteerMode::Replace) discards whatever was pending. Purely
+/// into the user turns to inject, in order. The channel is ordered, so folding in
+/// receive order honors the caller's sequence: [`Append`](SteerMode::Append) adds
+/// its text as one more pending turn, while [`Replace`](SteerMode::Replace)
+/// discards whatever is pending and starts over from its text. Purely
 /// non-blocking — it takes only what is already queued and never awaits.
-fn drain_steer(
-    steer: &mut mpsc::UnboundedReceiver<SteerCmd>,
-) -> Option<String> {
-    let mut pending: Option<String> = None;
+fn drain_steer(steer: &mut mpsc::UnboundedReceiver<SteerCmd>) -> Vec<String> {
+    let mut pending: Vec<String> = Vec::new();
     while let Ok(cmd) = steer.try_recv() {
         match cmd {
             SteerCmd::Input { text, mode } => match mode {
-                SteerMode::Append => {
-                    pending = Some(match pending {
-                        Some(prior) => format!("{prior}\n{text}"),
-                        None => text,
-                    });
+                SteerMode::Append => pending.push(text),
+                SteerMode::Replace => {
+                    pending.clear();
+                    pending.push(text);
                 }
-                SteerMode::Replace => pending = Some(text),
             },
             // Graceful finish is driven by the follow-up ticket; nothing to fold.
             SteerCmd::Finish => {}
